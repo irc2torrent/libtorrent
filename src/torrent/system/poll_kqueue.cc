@@ -9,12 +9,16 @@
 #include <map>
 #include <unistd.h>
 #include <sys/event.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
 
 #include "utils/log.h"
 #include "torrent/exceptions.h"
 #include "torrent/net/fd.h"
 #include "torrent/system/event.h"
 #include "torrent/system/thread.h"
+#include "torrent/system/types.h"
+#include "torrent/utils/chrono.h"
 
 // TODO: Change to use unordered_map, and at regular intervals trim the size?
 
@@ -153,10 +157,28 @@ PollInternal::poke_user_event() {
 
 std::unique_ptr<Poll>
 Poll::create() {
-  auto socket_open_max = sysconf(_SC_OPEN_MAX);
+  auto socket_open_max = []() {
+      auto sysconf_result = ::sysconf(_SC_OPEN_MAX);
+      int  sysconf_errno  = errno;
 
-  if (socket_open_max == -1)
-    throw internal_error("Poll::create() : sysconf(_SC_OPEN_MAX) failed : " + std::string(std::strerror(errno)));
+      if (sysconf_result != -1 && sysconf_result < INT_MAX / 2)
+        return static_cast<unsigned int>(sysconf_result);
+
+      int    maxfiles_perproc{};
+
+      size_t size   = sizeof(maxfiles_perproc);
+      int    mib[2] = {CTL_KERN, KERN_MAXFILES};
+
+      if (sysctl(mib, 2, &maxfiles_perproc, &size, nullptr, 0) == -1) {
+        auto msg = "Poll::create() : sysconf(_SC_OPEN_MAX) and sysctl(KERN_MAXFILESPERPROC) failed : " +
+          system::errno_enum_str(sysconf_errno) + " : " + system::errno_enum_str(errno);
+
+        LT_LOG("%s", msg.c_str());
+        throw internal_error(msg);
+      }
+
+      return std::min<unsigned int>(maxfiles_perproc, 16384u);
+    }();
 
   int fd = fd_open_kqueue();
 
@@ -195,6 +217,8 @@ Poll::cleanup_thread() {
 unsigned int
 Poll::do_poll(std::chrono::microseconds timeout) {
   int status = poll(timeout);
+
+  this_thread::thread()->set_cached_time(torrent::utils::time_since_epoch());
 
   if (status == -1) {
     if (errno != EINTR)
@@ -263,6 +287,14 @@ Poll::do_interrupt() {
 
   if (!m_polling_state.compare_exchange_strong(expected_state, flag_polling | flag_interrupted,
                                                std::memory_order_release, std::memory_order_relaxed))
+    return;
+
+  m_internal->poke_user_event();
+}
+
+void
+Poll::do_shutdown_interrupt() {
+  if (m_polling_state.fetch_or(flag_interrupted, std::memory_order_release) != flag_polling)
     return;
 
   m_internal->poke_user_event();

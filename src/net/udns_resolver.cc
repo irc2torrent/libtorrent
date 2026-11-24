@@ -3,6 +3,8 @@
 #include "net/udns_resolver.h"
 
 #include <cassert>
+#include <cstdlib>
+#include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -17,11 +19,11 @@
 #include "torrent/system/types.h"
 
 #define LT_LOG(log_fmt, ...)                                \
-  lt_log_print_subsystem(LOG_NET_DNS, "dns-resolver", log_fmt, __VA_ARGS__);
+  lt_log_print(LOG_NET_DNS, "dns-resolver : " log_fmt, __VA_ARGS__);
 #define LT_LOG_QUERY(log_fmt, ...)                                  \
-  lt_log_print(LOG_NET_DNS, "%016p->dns-resolver : " log_fmt, query->requester, __VA_ARGS__);
+  lt_log_print(LOG_NET_DNS, "%016p : dns-resolver : " log_fmt, query->requester, __VA_ARGS__);
 #define LT_LOG_REQUESTER(log_fmt, ...)                                  \
-  lt_log_print(LOG_NET_DNS, "%016p->dns-resolver : " log_fmt, requester, __VA_ARGS__);
+  lt_log_print(LOG_NET_DNS, "%016p : dns-resolver : " log_fmt, requester, __VA_ARGS__);
 
 namespace torrent::net {
 
@@ -160,7 +162,7 @@ UdnsResolver::resolve(void* requester, const std::string& hostname, int family, 
 
       // Unrecoverable errors, like ENOMEM.
       if (::dns_status(m_ctx) != DNS_E_BADQUERY)
-        throw new internal_error("dns_submit_a4 failed");
+        throw internal_error("dns_submit_a4 failed");
 
       // UDNS will fail immediately during submission of malformed domain names,
       // e.g., `..`. In order to maintain a clean interface, keep track of this
@@ -192,7 +194,7 @@ UdnsResolver::resolve(void* requester, const std::string& hostname, int family, 
       }
 
       if (::dns_status(m_ctx) != DNS_E_BADQUERY)
-        throw new internal_error("dns_submit_a6 failed");
+        throw internal_error("dns_submit_a6 failed");
 
       query->error_sin = EAI_NONAME;
 
@@ -366,11 +368,13 @@ UdnsResolver::process_timeouts() {
 
 void
 UdnsResolverInternal::a4_callback_wrapper(::dns_ctx *ctx, ::dns_rr_a4 *result, void *data) {
+  const std::unique_ptr<::dns_rr_a4, void (*)(void*)> result_owner(result, &std::free);
+
   auto query = static_cast<UdnsQuery*>(data);
   auto lock  = std::lock_guard(query->parent->m_mutex);
 
   if (query->deleted) {
-    LT_LOG_QUERY("A records received, but query was deleted : name:%s", query->requester, query->hostname.c_str());
+    LT_LOG_QUERY("A records received, but query was deleted : name:%s", query->hostname.c_str());
     throw internal_error("UdnsResolver::a4_callback_wrapper called with deleted query");
   }
 
@@ -426,6 +430,8 @@ UdnsResolverInternal::a4_callback_wrapper(::dns_ctx *ctx, ::dns_rr_a4 *result, v
 
 void
 UdnsResolverInternal::a6_callback_wrapper(::dns_ctx *ctx, ::dns_rr_a6 *result, void *data) {
+  const std::unique_ptr<::dns_rr_a6, void (*)(void*)> result_owner(result, &std::free);
+
   auto query = static_cast<UdnsQuery*>(data);
   auto lock  = std::lock_guard(query->parent->m_mutex);
 

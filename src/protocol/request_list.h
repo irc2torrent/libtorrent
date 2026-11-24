@@ -78,7 +78,7 @@ public:
   size_t               choked_size() const                { return m_queues.queue_size(bucket_choked); }
 
   uint32_t             pipe_size() const;
-  uint32_t             calculate_pipe_size(uint32_t rate);
+  uint32_t             calculate_pipe_size(uint32_t rate, uint32_t max_size);
 
   Delegator*           delegator()                       { return m_delegator; }
   void                 set_delegator(Delegator* d)       { m_delegator = d; }
@@ -106,8 +106,6 @@ private:
 
   std::optional<uint32_t> m_affinity;
 
-  std::chrono::microseconds m_last_choke{};
-  std::chrono::microseconds m_last_unchoke{};
   size_t                    m_last_unordered_position{0};
 
   torrent::system::SchedulerEntry m_delay_remove_choked;

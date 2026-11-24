@@ -180,8 +180,7 @@ Handshake::destroy_connection(bool use_socket_manager) {
   auto fn = [this]() {
       this_thread::poll()->remove_and_close(this);
 
-      fd_close(file_descriptor());
-      reset_file_descriptor();
+      fd_close_and_clear(file_descriptor_ref());
     };
 
   try {
@@ -194,11 +193,7 @@ Handshake::destroy_connection(bool use_socket_manager) {
     if (is_polling())
       this_thread::poll()->remove_and_close(this);
 
-    if (is_open()) {
-      fd_close(file_descriptor());
-      reset_file_descriptor();
-    }
-
+    fd_close_and_clear_if_open(file_descriptor_ref());
     throw;
   }
 
@@ -467,7 +462,7 @@ Handshake::read_encryption_negotiation() {
 
       m_encryption.info()->decrypt(m_readBuffer.position(), std::min<uint32_t>(m_readPos, m_readBuffer.remaining()));
 
-    } if (m_encryption.is_stream_encrypted()) {
+    } else if (m_encryption.is_stream_encrypted()) {
       LT_LOG_EXTRA_DEBUG_SA(m_address, "read_encryption_negotiation: peer offered encrypted stream", 0);
 
       if (m_encryption.policy().require_plaintext_stream())
@@ -1007,7 +1002,10 @@ Handshake::event_write() {
       if (m_encryption.policy().prefer_encrypted_handshake()) {
         prepare_key_plus_pad();
 
-        if (!m_encryption.policy().is_retrying() && m_encryption.policy().allow_plaintext_handshake())
+        // A plaintext handshake carries no RC4 stream, so there is no plaintext retry to arm when
+        // the stream is required to be encrypted.
+        if (!m_encryption.policy().is_retrying() && m_encryption.policy().allow_plaintext_handshake() &&
+            !m_encryption.policy().require_encrypted_stream())
           m_encryption.policy().set_retry_plaintext();
 
         m_state = READ_ENC_KEY;

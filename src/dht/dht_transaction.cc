@@ -20,10 +20,10 @@ const DhtMessage::key_list_type DhtMessage::base_type::keys;
 // DhtTransactionPacket:
 //
 
-DhtTransactionPacket::DhtTransactionPacket(const sockaddr* s, const DhtMessage& d, unsigned int id, std::shared_ptr<DhtTransaction> t)
+DhtTransactionPacket::DhtTransactionPacket(const sockaddr* s, const DhtMessage& d, unsigned int id, uint64_t transaction_key)
   : m_socket_address(sa_copy(s)),
     m_id(id),
-    m_transaction(std::move(t)) {
+    m_transaction_key(transaction_key) {
 
   build_buffer(d);
 }
@@ -59,34 +59,43 @@ DhtTransaction::~DhtTransaction() {
     m_packet->set_failed();
 }
 
+// The upper 32 bits of a key name the node's address: the IPv4 address itself, or a 32-bit FNV-1a fold of the IPv6
+// address (each family's server keeps its own transactions, and a reply is also checked against the full address).
+static uint64_t
+dht_transaction_addr_key(const sockaddr* sa) {
+  if (sa_is_inet(sa))
+    return reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr;
+
+  if (!sa_is_inet6(sa))
+    throw internal_error("DhtTransaction::key() called with non-inet address.");
+
+  auto bytes = reinterpret_cast<const unsigned char*>(&reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr);
+  uint32_t hash = 2166136261u;
+
+  for (int i = 0; i < 16; i++)
+    hash = (hash ^ bytes[i]) * 16777619u;
+
+  return hash;
+}
+
 DhtTransaction::key_type
 DhtTransaction::key(const sockaddr* sa, int id) {
-  if (sa_is_inet(sa))
-    return (static_cast<uint64_t>(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr) << 32) + id;
-  else if (sa_is_inet6(sa))
-    throw internal_error("DhtTransaction::key() called with inet6 address.");
-  else
-    throw internal_error("DhtTransaction::key() called with non-inet address.");
+  return (dht_transaction_addr_key(sa) << 32) + id;
 }
 
 bool
 DhtTransaction::key_match(key_type key, const sockaddr* sa) {
-  if (sa_is_inet(sa))
-    return (key >> 32) == static_cast<uint64_t>(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr);
-  else if (sa_is_inet6(sa))
-    throw internal_error("DhtTransaction::key_match() called with inet6 address.");
-  else
-    throw internal_error("DhtTransaction::key_match() called with non-inet address.");
+  return (key >> 32) == dht_transaction_addr_key(sa);
 }
 
 //
 // DhtTransactionSearch:
 //
 
-DhtTransactionSearch::DhtTransactionSearch(int quick_timeout, int timeout, dht::DhtSearch::const_accessor& node)
+DhtTransactionSearch::DhtTransactionSearch(int quick_timeout, int timeout, std::shared_ptr<dht::DhtSearch> search, dht::DhtSearch::const_accessor& node)
   : DhtTransaction(quick_timeout, timeout, node.node()->id(), node.node()->address()),
     m_node(node),
-    m_search(node.search()) {
+    m_search(std::move(search)) {
 
   if (!m_hasQuickTimeout)
     m_search->m_concurrency++;
@@ -112,9 +121,6 @@ void
 DhtTransactionSearch::complete(bool success) {
   if (m_node == m_search->end())
     throw internal_error("DhtTransactionSearch::complete() called multiple times.");
-
-  if (m_node.search() != m_search)
-    throw internal_error("DhtTransactionSearch::complete() called for node from wrong search.");
 
   if (!m_hasQuickTimeout)
     m_search->m_concurrency--;

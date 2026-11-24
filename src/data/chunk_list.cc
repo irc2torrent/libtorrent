@@ -10,8 +10,10 @@
 #include "torrent/utils/log.h"
 #include "utils/instrumentation.h"
 
-#define LT_LOG_THIS(log_level, log_fmt, ...)                              \
-  lt_log_print_data(LOG_STORAGE_##log_level, m_data, "chunk_list", log_fmt, __VA_ARGS__);
+#define LT_LOG_DEBUG(log_fmt, ...)                                        \
+  lt_log_print_hash(LOG_STORAGE_DEBUG, m_data->hash(), "chunk_list : " log_fmt, __VA_ARGS__);
+#define LT_LOG_EVENTS(log_fmt, ...)                                       \
+  lt_log_print_hash(LOG_STORAGE_EVENTS, m_data->hash(), "chunk_list : " log_fmt, __VA_ARGS__);
 
 namespace torrent {
 
@@ -29,14 +31,9 @@ ChunkList::is_queued(ChunkListNode* node) {
   return std::find(m_queue.begin(), m_queue.end(), node) != m_queue.end();
 }
 
-bool
-ChunkList::has_chunk(size_type index, int prot) const {
-  return base_type::at(index).is_valid() && base_type::at(index).chunk()->has_permissions(prot);
-}
-
 void
 ChunkList::resize(size_type to_size) {
-  LT_LOG_THIS(INFO, "Resizing: from:%zu to:%u.", size(), to_size);
+  LT_LOG_EVENTS("resize : from:%zu to:%u.", size(), to_size);
 
   if (!empty())
     throw internal_error("ChunkList::resize(...) called on an non-empty object.");
@@ -53,7 +50,7 @@ ChunkList::resize(size_type to_size) {
 
 void
 ChunkList::clear() {
-  LT_LOG_THIS(INFO, "Clearing.", 0);
+  LT_LOG_EVENTS("clear", 0);
 
   // Don't do any sync'ing as whomever decided to shut down really
   // doesn't care, so just de-reference all chunks in queue.
@@ -86,7 +83,7 @@ ChunkList::clear() {
 
 ChunkHandle
 ChunkList::get(size_type index, get_flags flags) {
-  LT_LOG_THIS(DEBUG, "Get: index:%" PRIu32 " flags:%#x.", index, flags);
+  LT_LOG_DEBUG("get : index:%" PRIu32 " flags:%#x.", index, flags);
 
   errno = 0;
 
@@ -97,7 +94,7 @@ ChunkList::get(size_type index, get_flags flags) {
 
   if (!node->is_valid()) {
     if (!m_manager->allocate(m_chunk_size, allocate_flags)) {
-      LT_LOG_THIS(DEBUG, "Could not allocate: memory:%" PRIu64 " block:%" PRIu32 ".",
+      LT_LOG_DEBUG("could not allocate : memory:%" PRIu64 " block:%" PRIu32 ".",
                   runtime::memory_manager()->memory_usage(), runtime::memory_manager()->memory_block_count());
 
       return ChunkHandle::from_error(ENOMEM);
@@ -115,7 +112,7 @@ ChunkList::get(size_type index, get_flags flags) {
     if (chunk == nullptr) {
       int err = errno;
 
-      LT_LOG_THIS(DEBUG, "Could not create: memory:%" PRIu64 " block:%" PRIu32 " errno:%i errmsg:%s.",
+      LT_LOG_DEBUG("could not create : memory:%" PRIu64 " block:%" PRIu32 " errno:%i errmsg:%s.",
                   runtime::memory_manager()->memory_usage(), runtime::memory_manager()->memory_block_count(),
                   err, std::strerror(err));
 
@@ -174,7 +171,7 @@ ChunkList::release(ChunkHandle* handle, release_flags flags) {
   if (handle->object() < &*begin() || handle->object() >= &*end())
     throw internal_error("ChunkList::release(...) received an unknown handle.");
 
-  LT_LOG_THIS(DEBUG, "Release: index:%" PRIu32 " flags:%#x.", handle->index(), flags);
+  LT_LOG_DEBUG("release : index:%" PRIu32 " flags:%#x.", handle->index(), flags);
 
   if (handle->object()->references() <= 0 ||
       (handle->is_writable() && handle->object()->writable() <= 0) ||
@@ -252,7 +249,7 @@ ChunkList::sync_chunk(ChunkListNode* node, std::pair<int,bool> options) {
 
 uint32_t
 ChunkList::sync_chunks(cache_list& cache, sync_flags flags) {
-  LT_LOG_THIS(DEBUG, "Sync chunks: flags:%#x.", flags);
+  LT_LOG_DEBUG("sync chunks : flags:%#x.", flags);
 
   if (m_queue.empty())
     return 0;
@@ -430,8 +427,6 @@ ChunkList::find_address(void* ptr) {
 
     if (partition != first->chunk()->end())
       return chunk_address_result(first, partition);
-
-    first++;
   }
 
   return chunk_address_result(end(), Chunk::iterator());

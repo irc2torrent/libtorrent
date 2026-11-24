@@ -1,5 +1,7 @@
 #include "config.h"
 
+#include "torrent/runtime/socket_manager.h"
+
 #include "curl_stack.h"
 
 #include <algorithm>
@@ -54,7 +56,7 @@ CurlStack::~CurlStack() {
 void
 CurlStack::set_max_cache_connections(unsigned int value) {
   if (value > 1024)
-    throw torrent::internal_error("CurlStack::set_max_cache_connections() called with a value greater than 1024.");
+    throw torrent::input_error("CurlStack::set_max_cache_connections() called with a value greater than 1024.");
 
   auto guard = lock_guard();
 
@@ -66,7 +68,7 @@ CurlStack::set_max_cache_connections(unsigned int value) {
 void
 CurlStack::set_max_host_connections(unsigned int value) {
   if (value > 1024)
-    throw torrent::internal_error("CurlStack::set_max_host_connections() called with a value greater than 1024.");
+    throw torrent::input_error("CurlStack::set_max_host_connections() called with a value greater than 1024.");
 
   auto guard = lock_guard();
 
@@ -77,8 +79,9 @@ CurlStack::set_max_host_connections(unsigned int value) {
 
 void
 CurlStack::set_max_total_connections(unsigned int value) {
-  if (value > 4096)
-    throw torrent::internal_error("CurlStack::set_max_total_connections() called with a value greater than 4096.");
+  if (value > torrent::runtime::SocketManager::http_max_alloc)
+    throw torrent::internal_error("CurlStack::set_max_total_connections() called with a value greater than " +
+                                  std::to_string(torrent::runtime::SocketManager::http_max_alloc) + ".");
 
   auto guard = lock_guard();
 
@@ -161,6 +164,8 @@ CurlStack::start_get(const std::shared_ptr<CurlGet>& curl_get) {
 
     curl_get->activate_unsafe();
   }
+
+  ensure_timeout_scheduled();
 }
 
 void
@@ -233,16 +238,29 @@ CurlStack::receive_timeout() {
     return;
   }
 
-  if (!m_task_timeout.is_scheduled()) {
-    // Sometimes libcurl forgets to reset the timeout. Try to poll the value in that case, or use 10
-    // seconds max.
-    long timeout_ms;
-    curl_multi_timeout(m_handle, &timeout_ms);
+  ensure_timeout_scheduled();
+}
 
-    auto timeout = std::max<std::chrono::microseconds>(std::chrono::milliseconds(timeout_ms), 10s);
+// The multi-socket API only enforces CURLOPT_TIMEOUT when libcurl is driven by socket activity or
+// the timer task. If the timer is not scheduled while transfers are active (e.g. libcurl cleared
+// it, or a connection through a dead proxy never produces socket events), a hung transfer would
+// never time out. Guarantee the stack is polled at least every 10 seconds while non-empty.
+void
+CurlStack::ensure_timeout_scheduled() {
+  assert(std::this_thread::get_id() == m_thread->thread_id());
 
-    torrent::this_thread::scheduler()->wait_for_ceil_seconds(&m_task_timeout, timeout);
-  }
+  if (base_type::empty() || m_task_timeout.is_scheduled())
+    return;
+
+  long timeout_ms{};
+  curl_multi_timeout(m_handle, &timeout_ms);
+
+  std::chrono::microseconds timeout = 10s;
+
+  if (timeout_ms >= 0)
+    timeout = std::min<std::chrono::microseconds>(std::chrono::milliseconds(timeout_ms), timeout);
+
+  torrent::this_thread::scheduler()->wait_for_ceil_seconds(&m_task_timeout, timeout);
 }
 
 // TODO: Check if curl_get is still active.

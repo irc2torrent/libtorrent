@@ -16,7 +16,7 @@
 #include "torrent/system/thread.h"
 #include "torrent/utils/log.h"
 #include "torrent/utils/uri_parser.h"
-#include "utils/functional.h"
+#include "torrent/utils/functional.h"
 
 #define LT_LOG(log_fmt, ...) \
   lt_log_print(LOG_NET_HTTP, "%p->http_get : " log_fmt, this, __VA_ARGS__)
@@ -337,7 +337,7 @@ CurlGet::prepare_start_unsafe(CurlStack* stack) {
 
   } catch (const torrent::input_error& e) {
     m_prepare_canceled = true;
-    ::utils::slot_list_call(m_signal_failed, e.what());
+    utils::slot_list_call(m_signal_failed, e.what());
     return false;
   }
 }
@@ -459,7 +459,7 @@ CurlGet::trigger_done() {
 
   LT_LOG("signal done : size:%" PRIi64 " slots:%zu", size_download_unsafe(), m_signal_done.size());
 
-  ::utils::slot_list_call(m_signal_done);
+  utils::slot_list_call(m_signal_done);
 }
 
 void
@@ -474,7 +474,7 @@ CurlGet::trigger_failed(const std::string& message) {
   LT_LOG("signal failed : %s", message.c_str());
 
   // If this is changed, verify RESOLVE_NONE handling is correct.
-  ::utils::slot_list_call(m_signal_failed, message);
+  utils::slot_list_call(m_signal_failed, message);
 }
 
 void
@@ -491,7 +491,7 @@ CurlGet::trigger_cleared_request() {
 
   LT_LOG("signal force cleared", 0);
 
-  ::utils::slot_list_call(m_signal_failed, "Request force cleared.");
+  utils::slot_list_call(m_signal_failed, "Request force cleared.");
 }
 
 size_t
@@ -504,33 +504,41 @@ CurlGet::receive_write(const char* data, size_t size, size_t nmemb, CurlGet* han
 
 bool
 CurlGet::prepare_resolve_unsafe(resolve_type current_resolve) {
-  auto [bind_inet_address, bind_inet6_address] = runtime::network_config()->bind_addresses_or_null();
+  auto [inet_address, inet_device, inet6_address, inet6_device] = runtime::network_config()->bind_tcp_addresses_or_null();
 
   int detected_family = utils::uri_detect_numeric(m_url);
 
+  auto set_interface_fn = [this](auto& address, auto& device) {
+      if (address->sa_family != AF_UNSPEC && !device.empty()) {
+        lt_easy_setopt(m_handle, CURLOPT_INTERFACE, ("ifhost!" + device + "!" + sa_addr_str(address.get())).c_str());
+      } else if (address->sa_family != AF_UNSPEC) {
+        lt_easy_setopt(m_handle, CURLOPT_INTERFACE, ("host!" + sa_addr_str(address.get())).c_str());
+      } else if (!device.empty()) {
+        lt_easy_setopt(m_handle, CURLOPT_INTERFACE, ("if!" + device).c_str());
+      }
+    };
+
   switch (current_resolve) {
   case RESOLVE_IPV4:
-    if (bind_inet_address == nullptr)
+    if (inet_address == nullptr)
       throw torrent::input_error("Bind address for requested IP protocol(s) not available.");
 
     if (detected_family == AF_INET6)
       throw torrent::input_error("Numeric IPv6 address in url, but IPv4 was requested.");
 
-    if (bind_inet_address->sa_family != AF_UNSPEC)
-      lt_easy_setopt(m_handle, CURLOPT_INTERFACE, sa_addr_str(bind_inet_address.get()).c_str());
+    set_interface_fn(inet_address, inet_device);
 
     lt_easy_setopt(m_handle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
     return true;
 
   case RESOLVE_IPV6:
-    if (bind_inet6_address == nullptr)
+    if (inet6_address == nullptr)
       throw torrent::input_error("Bind address for requested IP protocol(s) not available.");
 
     if (detected_family == AF_INET)
       throw torrent::input_error("Numeric IPv4 address in url, but IPv6 was requested.");
 
-    if (bind_inet6_address->sa_family != AF_UNSPEC)
-      lt_easy_setopt(m_handle, CURLOPT_INTERFACE, sa_addr_str(bind_inet6_address.get()).c_str());
+    set_interface_fn(inet6_address, inet6_device);
 
     lt_easy_setopt(m_handle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V6);
     return true;

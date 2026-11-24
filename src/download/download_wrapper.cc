@@ -18,13 +18,13 @@
 #include "torrent/utils/log.h"
 #include "tracker/thread_tracker.h"
 #include "tracker/tracker_list.h"
-#include "utils/functional.h"
+#include "torrent/utils/functional.h"
 #include "utils/sha1.h"
 
-#define LT_LOG_THIS(log_fmt, ...)                                       \
-  lt_log_print_info(LOG_TORRENT_INFO, this->info(), "download", log_fmt, __VA_ARGS__);
+#define LT_LOG_DEBUG(log_fmt, ...)                                     \
+  lt_log_print_hash(LOG_TORRENT_DEBUG, this->info()->hash(), "download : " log_fmt, __VA_ARGS__);
 #define LT_LOG_STORAGE_ERRORS(log_fmt, ...)                             \
-  lt_log_print_info(LOG_PROTOCOL_STORAGE_ERRORS, this->info(), "storage_errors", log_fmt, __VA_ARGS__);
+  lt_log_print_hash(LOG_PROTOCOL_STORAGE_ERRORS, this->info()->hash(), "storage_errors : " log_fmt, __VA_ARGS__);
 
 namespace torrent {
 
@@ -238,13 +238,13 @@ DownloadWrapper::receive_tracker_success(AddressList* l) {
   m_main->receive_connect_peers();
   m_main->receive_tracker_success();
 
-  ::utils::slot_list_call(info()->signal_tracker_success());
+  utils::slot_list_call(info()->signal_tracker_success());
   return inserted;
 }
 
 void
 DownloadWrapper::receive_tracker_failed(const std::string& msg) {
-  ::utils::slot_list_call(info()->signal_tracker_failed(), msg);
+  utils::slot_list_call(info()->signal_tracker_failed(), msg);
 }
 
 void
@@ -294,7 +294,7 @@ DownloadWrapper::receive_tick(uint32_t ticks) {
 
 void
 DownloadWrapper::receive_update_priorities() {
-  LT_LOG_THIS("update priorities: chunks_selected:%" PRIu32 " wanted_chunks:%" PRIu32,
+  LT_LOG_DEBUG("update priorities : chunks_selected:%" PRIu32 " wanted_chunks:%" PRIu32,
               m_main->chunk_selector()->size(), data()->wanted_chunks());
 
   data()->mutable_high_priority()->clear();
@@ -328,9 +328,12 @@ DownloadWrapper::receive_update_priorities() {
   }
 
   bool was_partial = data()->wanted_chunks() != 0;
-  data()->update_wanted_chunks();
 
-  m_main->chunk_selector()->update_priorities();
+  if (!m_main->chunk_selector()->empty()) {
+    data()->update_wanted_chunks();
+
+    m_main->chunk_selector()->update_priorities();
+  }
 
   for (const auto& peer : *m_main->connection_list()) {
     peer->m_ptr()->update_interested();

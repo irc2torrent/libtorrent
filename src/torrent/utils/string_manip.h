@@ -1,10 +1,12 @@
 #ifndef LIBTORRENT_TORRENT_UTILS_STRING_MANIP_H
 #define LIBTORRENT_TORRENT_UTILS_STRING_MANIP_H
 
+#include <cstdint>
 #include <exception>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <torrent/common.h>
 #include <torrent/exceptions.h>
 
@@ -14,6 +16,7 @@ namespace torrent::utils {
 // TODO: Consider forward declaring these functions, and instantiating the required specializations in the .cc file.
 
 bool             is_valid_utf8(const std::string& str) LIBTORRENT_EXPORT;
+bool             is_valid_utf8_text(const std::string& str) LIBTORRENT_EXPORT;
 
 std::string_view trim_spaces(std::string_view s) LIBTORRENT_EXPORT;
 std::string      trim_spaces_str(std::string_view s) LIBTORRENT_EXPORT;

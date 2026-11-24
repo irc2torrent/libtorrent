@@ -6,15 +6,17 @@
 #include <cassert>
 #include <cstdlib>
 
+#include "download/download_main.h"
 #include "protocol/peer_connection_base.h"
+#include "torrent/download_info.h"
 #include "torrent/download/group_entry.h"
 #include "torrent/peer/connection_list.h"
 #include "torrent/peer/choke_status.h"
 #include "torrent/utils/log.h"
+#include "torrent/utils/limited_vector.h"
 
-// TODO: Add a different logging category.
-#define LT_LOG_THIS(log_fmt, ...)                                       \
-  lt_log_print_subsystem(LOG_TORRENT_INFO, "choke_queue", log_fmt, __VA_ARGS__);
+#define LT_LOG_DEBUG(log_fmt, ...)                          \
+  lt_log_print(LOG_TORRENT_DEBUG, "choke_queue : " log_fmt, __VA_ARGS__);
 
 namespace torrent {
 
@@ -51,10 +53,15 @@ choke_queue::~choke_queue() {
 
 inline uint32_t
 choke_queue::max_alternate() const {
-  if (m_currently_unchoked < 31)
-    return (m_currently_unchoked + 7) / 8;
+  return rotate_count(m_currently_unchoked);
+}
+
+uint32_t
+choke_queue::rotate_count(uint32_t slots) {
+  if (slots < 31)
+    return (slots + 7) / 8;
   else
-    return (m_currently_unchoked + 9) / 10;
+    return (slots + 9) / 10;
 }
 
 group_stats
@@ -89,8 +96,11 @@ choke_queue::prepare_weights(group_stats gs) {
 }
 
 group_stats
-choke_queue::retrieve_connections(group_stats gs, container_type* queued, container_type* unchoked) {
+choke_queue::retrieve_connections(group_stats gs, container_type* queued, container_type* unchoked, bool rotate) {
   for (auto entry : m_group_container) {
+    if (rotate)
+      rotate_entry(entry);
+
     unsigned int min_slots = std::min(entry->min_slots(), entry->max_slots());
 
     lt_log_print(LOG_PEER_CHOKE_QUEUE, "Choke queue retrieve_connections; queued:%u unchoked:%u min_slots:%u max_slots:%u.",
@@ -156,10 +166,13 @@ choke_queue::rebuild_containers(container_type* queued, container_type* unchoked
 
 void
 choke_queue::balance() {
-  LT_LOG_THIS("balancing queue: heuristics:%i currently_unchoked:%" PRIu32 " max_unchoked:%" PRIu32,
-              m_heuristics,
-              m_currently_unchoked,
-              m_maxUnchoked);
+  // A group that was never given its slots cannot be balanced; calling through
+  // an empty std::function would terminate the client.
+  if (!m_slotCanUnchoke)
+    return;
+
+  LT_LOG_DEBUG("balancing : heuristics:%i currently_unchoked:%" PRIu32 " max_unchoked:%" PRIu32,
+              m_heuristics, m_currently_unchoked, m_maxUnchoked);
 
   // Return if no balancing is needed. Don't return if is_unlimited()
   // as we might have just changed the value and have interested that
@@ -176,7 +189,7 @@ choke_queue::balance() {
   group_stats gs{};
 
   gs = prepare_weights(gs);
-  gs = retrieve_connections(gs, &queued, &unchoked);
+  gs = retrieve_connections(gs, &queued, &unchoked, false);
 
   if (gs.changed_unchoked != 0)
     m_slotUnchoke(gs.changed_unchoked);
@@ -210,7 +223,7 @@ choke_queue::balance() {
   if (result != 0)
     m_slotUnchoke(result);
 
-  LT_LOG_THIS("balanced queue: adjust:%i can_unchoke:%i queued:%zu unchoked:%zu result:%i",
+  LT_LOG_DEBUG("balanced : adjust:%i can_unchoke:%i queued:%zu unchoked:%zu result:%i",
                adjust, can_unchoke, queued.size(), unchoked.size(), result);
 }
 
@@ -234,6 +247,67 @@ choke_queue::balance_entry(group_entry* entry) {
   m_slotUnchoke(count);
 }
 
+// retrieve_connections() offers a torrent's queue only while it has a free slot, so once its download slots are all
+// held the first peers to unchoke it keep them, however little they send. prepare_weights() has just put the slowest
+// holders last: give the slots of those that held theirs for rotate_grace to the peers that have waited longest.
+uint32_t
+choke_queue::rotate_entry(group_entry* entry) {
+  if (entry->unchoked()->size() < entry->max_slots() || entry->queued()->empty())
+    return 0;
+
+  auto     now         = this_thread::cached_time();
+  auto     max         = std::min<uint32_t>(rotate_count(entry->max_slots()), entry->queued()->size());
+  uint32_t count       = 0;
+  uint64_t fastest_out = 0;
+
+  // A choke swaps the last holder into the place of the one taken out, and that one was already passed.
+  for (auto i = entry->unchoked()->size(); i-- != 0 && count < max;) {
+    auto pcb = (*entry->unchoked())[i].connection;
+
+    if (pcb->down_choke()->time_last_choke() + rotate_grace > now)
+      continue;
+
+    fastest_out = std::max(fastest_out, pcb->peer_chunks()->download_throttle()->rate()->rate());
+
+    m_slotConnection(pcb, true);
+    pcb->keep_down_interest();
+    count++;
+  }
+
+  if (count == 0)
+    return 0;
+
+  // The count peers that have waited longest, oldest first: never slotted, then out longest, the
+  // slots just taken back last.
+  //
+  // The list starts with the peers at a random place in the queue, as the optimistic unchokes pick,
+  // and the rest replace its newest only if older, so among equal waits a peer that came late is
+  // not tried last.
+  struct peer_compare {
+    bool operator()(const choke_queue::value_type& a, const choke_queue::value_type& b) const {
+      return a.connection->down_choke()->time_last_choke() < b.connection->down_choke()->time_last_choke();
+    }
+  };
+
+  utils::limited_vector<weighted_connection, peer_compare> oldest_peers(count);
+
+  auto&  queued = *entry->queued();
+  size_t start  = ::random() % queued.size();
+
+  utils::copy_limited(queued.begin() + start, queued.end(), oldest_peers);
+  utils::copy_limited(queued.begin(), queued.begin() + start, oldest_peers);
+
+  // An unchoke moves its peer out of the queue, so the list holds copies.
+  for (auto& peer : oldest_peers)
+    m_slotConnection(peer.connection, false);
+
+  lt_log_print_info(LOG_TORRENT_EVENTS, entry->unchoked()->back().connection->download()->info(),
+                    "download : rotated %" PRIu32 " of %" PRIu32 " download slots : fastest out %" PRIu64 " B/s : queued:%zu",
+                    count, entry->max_slots(), fastest_out, entry->queued()->size());
+
+  return count;
+}
+
 int
 choke_queue::cycle(uint32_t quota) {
   // TODO: This should not use the old values, but rather the number
@@ -253,12 +327,12 @@ choke_queue::cycle(uint32_t quota) {
   group_stats gs{};
 
   gs = prepare_weights(gs);
-  gs = retrieve_connections(gs, &queued, &unchoked);
+  gs = retrieve_connections(gs, &queued, &unchoked, m_heuristics == HEURISTICS_DOWNLOAD_LEECH);
 
   quota = std::min(quota, m_maxUnchoked);
   quota = quota - std::min(quota, gs.now_unchoked);
 
-  uint32_t adjust = (unchoked.size() < quota) ? (quota - unchoked.size()) : 0; 
+  uint32_t adjust = (unchoked.size() < quota) ? (quota - unchoked.size()) : 0;
   adjust = std::max(adjust, alternate);
   adjust = std::min(adjust, quota);
 
@@ -288,10 +362,12 @@ choke_queue::set_queued(PeerConnectionBase* pc, choke_status* base) {
   if (base->queued() || base->unchoked())
     return;
 
-  base->set_queued(true);
-
-  if (base->snubbed())
+  if (base->snubbed()) {
+    base->set_queued_snub(true);
     return;
+  }
+
+  base->set_queued(true);
 
   base->entry()->connection_queued(pc);
   modify_currently_queued(1);
@@ -307,13 +383,15 @@ choke_queue::set_queued(PeerConnectionBase* pc, choke_status* base) {
 
 void
 choke_queue::set_not_queued(PeerConnectionBase* pc, choke_status* base) {
+  if (base->snubbed()) {
+    base->set_queued_snub(false);
+    return;
+  }
+
   if (!base->queued())
     return;
 
   base->set_queued(false);
-
-  if (base->snubbed())
-    return;
 
   if (base->unchoked()) {
     m_slotConnection(pc, true);
@@ -342,6 +420,7 @@ choke_queue::set_snubbed(PeerConnectionBase* pc, choke_status* base) {
   base->entry()->connection_unqueued(pc);
   modify_currently_queued(-1);
 
+  base->set_queued_snub(true);
   base->set_queued(false);
 }
 
@@ -352,11 +431,14 @@ choke_queue::set_not_snubbed(PeerConnectionBase* pc, choke_status* base) {
 
   base->set_snubbed(false);
 
-  if (!base->queued())
+  if (!base->queued_snub())
     return;
 
   if (base->unchoked())
     throw internal_error("choke_queue::set_not_snubbed(...) base->unchoked().");
+
+  base->set_queued_snub(false);
+  base->set_queued(true);
 
   base->entry()->connection_queued(pc);
   modify_currently_queued(1);
@@ -388,6 +470,7 @@ choke_queue::disconnected(PeerConnectionBase* pc, choke_status* base) {
   }
 
   base->set_queued(false);
+  base->set_queued_snub(false);
 }
 
 // No need to do any choking as the next choke balancing will take
@@ -454,7 +537,7 @@ choke_manager_allocate_slots(choke_queue::iterator first, choke_queue::iterator 
 
       if (weights[itr] == 0 || target[itr].first >= s)
         continue;
-      
+
       uint32_t u = std::min(s - target[itr].first, base * weights[itr]);
 
       unchoke -= u;
@@ -543,7 +626,7 @@ choke_queue::adjust_choke_range(iterator first, iterator last,
 
     if ((itr - 1)->first > order_size)
       throw internal_error("choke_queue::adjust_choke_range(...) itr->first > std::distance((itr - 1)->second, itr->second).");
-    
+
     (itr - 1)->first += std::min(skipped, order_remaining);
     skipped          -= std::min(skipped, order_remaining);
 
@@ -578,7 +661,7 @@ choke_queue::adjust_choke_range(iterator first, iterator last,
 
       lt_log_print(LOG_INSTRUMENTATION_CHOKE,
                    "%p %i %s %p %X %llu %llu",
-                   this, 
+                   this,
                    0, //lf->last_update(),
                    (const char*)"unchoke" + 2*is_choke,
                    itr_adjust->connection,

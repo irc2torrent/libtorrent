@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "torrent/system/event.h"
+#include "torrent/system/scheduler.h"
 
 namespace torrent {
 
@@ -13,6 +14,8 @@ class Handshake;
 
 class Listen : public system::Event {
 public:
+  using listen_info = std::tuple<Listen*, const sockaddr*, std::string>;
+
   struct open_options {
     uint16_t        first_port{};
     uint16_t        last_port{};
@@ -21,14 +24,13 @@ public:
     bool            check_dht{};
   };
 
+  Listen();
   ~Listen() override { close(); }
 
   const char*         type_name() const override { return "listen"; }
 
-  static bool         open_single(Listen* listen, const sockaddr* bind_address, open_options options);
-
-  static bool         open_both(Listen* listen_inet, Listen* listen_inet6, const sockaddr* bind_inet_address, const sockaddr* bind_inet6_address,
-                                open_options options);
+  static bool         open_single(listen_info listen, open_options options);
+  static bool         open_both(listen_info listen4, listen_info listen6, open_options options);
 
   void                close();
 
@@ -44,9 +46,12 @@ private:
   using slot_accept_type = std::function<void(std::unique_ptr<Handshake>& handshake, int, const sockaddr*)>;
 
   void                open_done(int fd, uint16_t port, int backlog);
+  void                pause_accept(int error);
+  void                resume_accept();
 
-  uint16_t            m_port{0};
-  slot_accept_type    m_slot_accepted;
+  uint16_t               m_port{0};
+  slot_accept_type       m_slot_accepted;
+  system::SchedulerEntry m_resume_accept;
 };
 
 } // namespace torrent

@@ -13,11 +13,11 @@
 #include "tracker/udp_router.h"
 
 #define LT_LOG(log_fmt, ...)                                            \
-  lt_log_print_hash(LOG_TRACKER_REQUESTS, info().info_hash, "tracker_udp", "%p : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
+  lt_log_print_hash(LOG_TRACKER_REQUESTS, info().info_hash, "%p : tracker_udp : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
 
 #define LT_LOG_DUMP(log_dump_data, log_dump_size, log_fmt, ...)         \
   lt_log_print_hash_dump(LOG_TRACKER_DUMP, log_dump_data, log_dump_size, info().info_hash, \
-                         "tracker_udp", "%p : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
+                         "%p : tracker_udp : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
 
 namespace torrent::tracker {
 
@@ -111,6 +111,8 @@ TrackerUdp::reset_family_with_error(int family, const std::string& msg) {
   // Don't clear packet_sent to ensure disownable flag remains set.
   switch (family) {
   case AF_INET:
+    m_inet_state.error_message = msg;
+
     if (m_inet_state.transaction_id == 0)
       return; // TODO: Should we throw?
 
@@ -118,6 +120,8 @@ TrackerUdp::reset_family_with_error(int family, const std::string& msg) {
     m_inet_state.connection_id  = 0;
     break;
   case AF_INET6:
+    m_inet6_state.error_message = msg;
+
     if (m_inet6_state.transaction_id == 0)
       return; // TODO: Should we throw?
 
@@ -129,14 +133,16 @@ TrackerUdp::reset_family_with_error(int family, const std::string& msg) {
   }
 
   if (m_inet_state.transaction_id != 0 || m_inet6_state.transaction_id != 0)
-    return; // TODO: Save message.
+    return;
 
   LT_LOG("closing with error : hostname:%s port:%u : %s", m_hostname.c_str(), m_port, msg.c_str());
 
   remove_events();
   update_requesting_state();
 
-  m_slot_failure(msg);
+  auto& last_msg = family == AF_INET ? m_inet6_state.error_message : m_inet_state.error_message;
+
+  m_slot_failure(generate_error_message(family, msg, last_msg));
 }
 
 void
@@ -298,7 +304,9 @@ TrackerUdp::prepare_announce(int family, uint32_t id, buffer_type& buffer) {
 
   buffer.write_32(info().key);
   buffer.write_32(m_params.numwant);
-  buffer.write_16(runtime::listen_port());
+
+  auto local_port = runtime::network_config()->local_port_for_family(family);
+  buffer.write_16(local_port != 0 ? local_port : runtime::listen_port());
 
   if (buffer.size_end() != 98)
     throw internal_error("TrackerUdp::prepare_announce() unexpected buffer size.");

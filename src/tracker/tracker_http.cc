@@ -22,11 +22,11 @@
 #include "manager.h"
 
 #define LT_LOG(log_fmt, ...)                                            \
-  lt_log_print_hash(LOG_TRACKER_REQUESTS, info().info_hash, "tracker_http", "%p : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
+  lt_log_print_hash(LOG_TRACKER_REQUESTS, info().info_hash, "%p : tracker_http : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
 
 #define LT_LOG_DUMP(log_dump_data, log_dump_size, log_fmt, ...)         \
   lt_log_print_hash_dump(LOG_TRACKER_DUMP, log_dump_data, log_dump_size, info().info_hash, \
-                         "tracker_http", "%p : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
+                         "%p : tracker_http : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
 
 namespace torrent {
 
@@ -213,19 +213,21 @@ TrackerHttp::send_scrape_unsafe() {
 
 bool
 TrackerHttp::send_next_family(bool scrape) {
-  m_current_family = m_next_family;
-  m_next_family    = AF_UNSPEC;
-
-  if (m_current_family == AF_UNSPEC)
+  if (m_next_family == AF_UNSPEC)
     return false;
-
-  auto state = lock_and_latest_event();
 
   // TODO: If stopped state, don't bother if the other protocol hasn't been confirmed to work. (add vars to track this)
 
-  if ((m_current_family == AF_INET && runtime::network_config()->is_block_ipv4()) ||
-      (m_current_family == AF_INET6 && runtime::network_config()->is_block_ipv6()))
+  if ((m_next_family == AF_INET && runtime::network_config()->is_block_ipv4()) ||
+      (m_next_family == AF_INET6 && runtime::network_config()->is_block_ipv6())) {
+    m_next_family = AF_UNSPEC;
     return false;
+  }
+
+  m_current_family = m_next_family;
+  m_next_family    = AF_UNSPEC;
+
+  auto state = lock_and_latest_event();
 
   if (scrape)
     send_scrape_unsafe();
@@ -313,7 +315,9 @@ TrackerHttp::request_announce_url(tracker::TrackerState::event_enum state, int f
   if (m_params.numwant >= 0 && state != tracker::TrackerState::EVENT_STOPPED)
     s << "&numwant=" << m_params.numwant;
 
-  s << "&port="       << runtime::listen_port()
+  auto local_port = runtime::network_config()->local_port_for_family(family);
+
+  s << "&port="       << (local_port != 0 ? local_port : runtime::listen_port())
     << "&uploaded="   << m_params.uploaded_adjusted
     << "&downloaded=" << m_params.completed_adjusted
     << "&left="       << m_params.download_left;
@@ -478,12 +482,16 @@ TrackerHttp::receive_failed(const std::string& msg) {
 
     LT_LOG("received scrape failure : url:%s : %s", info().url.c_str(), msg.c_str());
 
+    update_requesting_state();
+
     m_requested_scrape = false;
     m_slot_scrape_failure(msg);
     return;
   }
 
   if (send_next_family()) {
+    LT_LOG("received failure : first family : url:%s : %s", info().url.c_str(), msg.c_str());
+
     m_last_success       = false;
     m_last_error_message = msg;
     return;
@@ -496,13 +504,11 @@ TrackerHttp::receive_failed(const std::string& msg) {
     LT_LOG("received failure : previous family succeeded : url:%s : %s", info().url.c_str(), msg.c_str());
     m_slot_success(AddressList());
 
-  } else if (!m_last_error_message.empty()) {
-    LT_LOG("received failure : previous family also failed : url:%s : %s /// %s", info().url.c_str(), msg.c_str(), m_last_error_message.c_str());
-    m_slot_failure(msg + " /// " + m_last_error_message);
-
   } else {
-    LT_LOG("received failure : url:%s : %s", info().url.c_str(), msg.c_str());
-    m_slot_failure(msg);
+    auto error_msg = generate_error_message(m_current_family, msg, m_last_error_message);
+
+    LT_LOG("received failure : url:%s : %s", info().url.c_str(), error_msg.c_str());
+    m_slot_failure(error_msg);
   }
 
   if (m_requested_scrape && m_data == nullptr)

@@ -336,7 +336,7 @@ Block::invalidate_transfer(BlockTransfer* transfer) {
 
   transfer->set_block(NULL);
 
-  if (transfer->stall() == 0) {
+  if (!transfer->is_erased() && transfer->stall() == 0) {
     if (m_notStalled == 0)
       throw internal_error("Block::invalidate_transfer(...) m_notStalled == 0.");
 
@@ -349,8 +349,13 @@ Block::invalidate_transfer(BlockTransfer* transfer) {
   }
 
   // Do the canceling magic here.
-  if (transfer->peer_info()->connection() != NULL)
+  if (transfer->peer_info()->connection() != NULL) {
     transfer->peer_info()->connection()->cancel_transfer(transfer);
+    return;
+  }
+
+  transfer->set_peer_info(NULL);
+  delete transfer;
 }
 
 void

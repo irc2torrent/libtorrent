@@ -45,31 +45,28 @@ check_flags_conflict(int lhs, int rhs) {
 
 } // namespace
 
-directory_events::directory_events() {
-  reset_file_descriptor();
-}
-
 bool
 directory_events::open() {
   if (is_open())
     return true;
 
+#ifdef USE_INOTIFY
   errno = 0;
 
-#ifdef USE_INOTIFY
   set_file_descriptor(fd_open_inotify());
 
-  if (is_open() && !fd_set_nonblock(file_descriptor())) {
-    fd_close(file_descriptor());
-    reset_file_descriptor();
+  if (!is_open())
+    return false;
+
+  if (!fd_set_nonblock(file_descriptor())) {
+    fd_close_and_clear(file_descriptor_ref());
+    return false;
   }
 
 #else
   errno = ENODEV;
+  return false;
 #endif
-
-  if (!is_open())
-    return false;
 
   this_thread::poll()->open(this);
   this_thread::poll()->insert_read(this);
@@ -85,8 +82,7 @@ directory_events::close() {
   this_thread::poll()->remove_read(this);
   this_thread::poll()->close(this);
 
-  ::close(file_descriptor());
-  reset_file_descriptor();
+  fd_close_and_clear(file_descriptor_ref());
   m_wd_list.clear();
 }
 
@@ -156,17 +152,19 @@ directory_events::event_read() {
   while (event + 1 <= reinterpret_cast<struct inotify_event*>(buffer + result)) {
     auto next_event = reinterpret_cast<char*>(event) + sizeof(struct inotify_event) + event->len;
 
-    if (event->len == 0 || next_event > buffer + result)
+    if (next_event > buffer + result)
       return;
 
-    auto itr = std::find_if(m_wd_list.begin(), m_wd_list.end(), [event](const auto& w) {
-      return event->wd == w.descriptor;
-    });
+    if (event->len != 0) {
+      auto itr = std::find_if(m_wd_list.begin(), m_wd_list.end(), [event](const auto& w) {
+        return event->wd == w.descriptor;
+      });
 
-    if (itr != m_wd_list.end()) {
-      std::string sname(event->name);
-      if (sname.size() >= 8 && sname.compare(sname.size() - 8, 8, ".torrent") == 0)
-        itr->slot(itr->path + event->name);
+      if (itr != m_wd_list.end()) {
+        std::string sname(event->name);
+        if (sname.size() >= 8 && sname.compare(sname.size() - 8, 8, ".torrent") == 0)
+          itr->slot(itr->path + event->name);
+      }
     }
 
     event = reinterpret_cast<struct inotify_event*>(next_event);

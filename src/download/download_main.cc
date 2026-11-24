@@ -34,9 +34,6 @@
 #include "tracker/tracker_controller.h"
 #include "tracker/tracker_list.h"
 
-#define LT_LOG_THIS(log_level, log_fmt, ...)                         \
-  lt_log_print_info(LOG_TORRENT_##log_level, m_ptr->info(), "download", log_fmt, __VA_ARGS__);
-
 namespace torrent {
 
 DownloadMain::DownloadMain()
@@ -52,7 +49,7 @@ DownloadMain::DownloadMain()
 
   // Only set trivial values here, the rest is done in DownloadWrapper.
 
-  m_delegator.slot_chunk_find() = [this](auto pc, auto prio) { return m_chunkSelector->find(pc, prio); };
+  m_delegator.slot_chunk_find() = [this](auto pc) { return m_chunkSelector->find(pc); };
   m_delegator.slot_chunk_size() = [this](auto i) { return file_list()->chunk_index_size(i); };
 
   m_delegator.transfer_list()->slot_canceled()  = [this](auto i) { m_chunkSelector->not_using_index(i); };
@@ -382,6 +379,16 @@ DownloadMain::do_peer_exchange() {
     auto pcb = connection->m_ptr();
     auto sa  = pcb->peer_info()->socket_address();
 
+    // Still using the old buffer? Make a copy in this rare case. Both pex buffers are freed at
+    // the end of this function, so the copy has to happen before any continue below.
+    DataBuffer* message = pcb->extension_message();
+
+    if (!message->empty() && (message->data() == m_ut_pex_initial.data() || message->data() == m_ut_pex_delta.data())) {
+      auto buffer = new char[message->length()];
+      memcpy(buffer, message->data(), message->length());
+      message->set(buffer, buffer + message->length(), true);
+    }
+
     if (pcb->peer_info()->listen_port() != 0 && sa->sa_family == AF_INET) {
       // The reinterpret_cast requires const in push_back, while not in emplace_back.
       //
@@ -406,15 +413,6 @@ DownloadMain::do_peer_exchange() {
       pcb->set_peer_exchange(false);
 
       continue;
-    }
-
-    // Still using the old buffer? Make a copy in this rare case.
-    DataBuffer* message = pcb->extension_message();
-
-    if (!message->empty() && (message->data() == m_ut_pex_initial.data() || message->data() == m_ut_pex_delta.data())) {
-      auto buffer = new char[message->length()];
-      memcpy(buffer, message->data(), message->length());
-      message->set(buffer, buffer + message->length(), true);
     }
 
     pcb->do_peer_exchange();

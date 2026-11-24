@@ -113,28 +113,9 @@ constexpr const char* option_list_handshake_connection[] = {
 };
 
 constexpr const char* option_list_log_group[] = {
-  "critical",
-  "error",
-  "warn",
-  "notice",
-  "info",
-  "debug",
-
-  "storage_critical",
-  "storage_error",
-  "storage_warn",
-  "storage_notice",
-  "storage_info",
-  "storage_debug",
-
-  "torrent_critical",
-  "torrent_error",
-  "torrent_warn",
-  "torrent_notice",
-  "torrent_info",
-  "torrent_debug",
-
-  "__non_cascading__",
+  "errors",
+  "events",
+  "debug_trace",
 
   "connection",
   "connection_bind",
@@ -178,11 +159,16 @@ constexpr const char* option_list_log_group[] = {
   "rpc_dump",
 
   "session_events",
-  "storage",
+  "storage_debug",
+  "storage_events",
+  "storage_errors",
 
   "system",
   "system_poll",
   "system_thread",
+
+  "torrent_debug",
+  "torrent_events",
 
   "tracker_dump",
   "tracker_events",

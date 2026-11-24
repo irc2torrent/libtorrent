@@ -37,7 +37,6 @@ libtorrent_torrent_la_SOURCES = \
 \
 	net/address_info.cc \
 	net/address_info.h \
-	net/connection_state.h \
 	net/fd.cc \
 	net/fd.h \
 	net/http_get.cc \
@@ -116,6 +115,8 @@ libtorrent_torrent_la_SOURCES = \
 	utils/directory_events.h \
 	utils/extents.h \
 	utils/file_stat.h \
+	utils/functional.h \
+	utils/linked_unordered_set.h \
 	utils/log.cc \
 	utils/log.h \
 	utils/log_buffer.cc \
@@ -127,6 +128,8 @@ libtorrent_torrent_la_SOURCES = \
 	utils/ranges.h \
 	utils/resume.cc \
 	utils/resume.h \
+	utils/scope.h \
+	utils/limited_vector.h \
 	utils/string_manip.cc \
 	utils/string_manip.h \
 	utils/unordered_vector.h \
@@ -187,7 +190,6 @@ libtorrent_torrent_download_include_HEADERS = \
 libtorrent_torrent_net_includedir = $(includedir)/torrent/net
 libtorrent_torrent_net_include_HEADERS = \
 	net/address_info.h \
-	net/connection_state.h \
 	net/fd.h \
 	net/http_get.h \
 	net/http_stack.h \
@@ -245,12 +247,15 @@ libtorrent_torrent_utils_include_HEADERS = \
 	utils/directory_events.h \
 	utils/extents.h \
 	utils/file_stat.h \
+	utils/functional.h \
+	utils/linked_unordered_set.h \
 	utils/log.h \
 	utils/log_buffer.h \
 	utils/option_strings.h \
 	utils/random.h \
 	utils/ranges.h \
 	utils/resume.h \
+	utils/limited_vector.h \
 	utils/string_manip.h \
 	utils/unordered_vector.h \
 	utils/uri_parser.h

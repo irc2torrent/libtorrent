@@ -4,6 +4,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <limits>
 
 #include "manager.h"
 #include "download/download_main.h"
@@ -35,6 +36,7 @@ const ExtHandshakeMessage::key_list_type ExtHandshakeMessage::keys = {
 template <>
 const ExtPEXMessage::key_list_type ExtPEXMessage::keys = {
   { key_pex_added,    "added*S" },
+  { key_pex_added6,   "added6*S" },
 };
 
 // DEBUG: Add type info.
@@ -55,6 +57,17 @@ const message_type message_keys[] = {
   { "ut_pex", key_m_utPex },
   { "metadata_size", key_m_utMetadata }
 };
+
+ProtocolExtension::~ProtocolExtension() {
+  // A teardown path that skips cleanup() must still release this
+  // connection's share of the download's PEX count, or the count leaks and
+  // ~DownloadMain's size_pex assert kills the process on the next erase.
+  if (m_download != NULL && is_local_enabled(UT_PEX))
+    unset_local_enabled(UT_PEX);
+
+  delete [] m_read;
+  m_pending.clear();
+}
 
 void
 ProtocolExtension::cleanup() {
@@ -142,11 +155,15 @@ ProtocolExtension::build_bencode(size_t maxLength, const char* format, ...) {
 
   va_list args;
   va_start(args, format);
-  unsigned int length = vsnprintf(b, maxLength, format, args);
+  int length = vsnprintf(b, maxLength, format, args);
   va_end(args);
 
-  if (length > maxLength)
+  // vsnprintf returns the length it would have written, and reserves one
+  // byte of the buffer for the terminating null.
+  if (length < 0 || static_cast<size_t>(length) >= maxLength) {
+    delete [] b;
     throw internal_error("ProtocolExtension::build_bencode wrote past buffer.");
+  }
 
   return DataBuffer(b, b + length);
 }
@@ -172,11 +189,17 @@ ProtocolExtension::generate_ut_pex_message(const PEXList& added, const PEXList& 
   auto end = buffer;
 
   end += sprintf(end, "d5:added%d:", added_len);
-  memcpy(end, added.begin()->c_str(), added_len);
+
+  if (!added.empty())
+    memcpy(end, added.begin()->c_str(), added_len);
+
   end += added_len;
 
   end += sprintf(end, "7:dropped%d:", removed_len);
-  memcpy(end, removed.begin()->c_str(), removed_len);
+
+  if (!removed.empty())
+    memcpy(end, removed.begin()->c_str(), removed_len);
+
   end += removed_len;
 
   *end++ = 'e';
@@ -210,7 +233,7 @@ ProtocolExtension::read_start(int type, uint32_t length, bool skip) {
 }
 
 bool
-ProtocolExtension::read_done() {
+ProtocolExtension::read_done(bool keep_unprocessed) {
   bool result = true;
 
   try {
@@ -229,11 +252,17 @@ ProtocolExtension::read_done() {
 //     throw internal_error("ProtocolExtension::read_done '" + std::string(m_read, std::distance(m_read, m_readPos)) + "'");
   }
 
+  m_flags |= flag_received_ext;
+
+  // Keep the message the parser could not process, so the caller can parse it
+  // again once the queued reply has been sent.
+  if (!result && keep_unprocessed)
+    return false;
+
   delete [] m_read;
   m_read = NULL;
 
   m_readType = FIRST_INVALID;
-  m_flags |= flag_received_ext;
 
   return result;
 }
@@ -284,11 +313,15 @@ ProtocolExtension::parse_handshake() {
       m_peerInfo->set_listen_port(port);
   }
 
-  if (message[key_reqq].is_value())
-    m_maxQueueLength = message[key_reqq].as_value();
-
   if (message[key_metadataSize].is_value())
     m_download->set_metadata_size(message[key_metadataSize].as_value());
+
+  if (message[key_reqq].is_value()) {
+    int64_t reqq = message[key_reqq].as_value();
+
+    if (reqq > 0)
+      m_peer_request_queue = std::min<int64_t>(reqq, std::numeric_limits<uint32_t>::max());
+  }
 
   m_flags &= ~flag_initial_handshake;
 
@@ -304,10 +337,12 @@ ProtocolExtension::parse_ut_pex() {
   static_map_read_bencode(m_read, m_readPos, message);
 
   // TODO: Check if pex is enabled?
-  if (!message[key_pex_added].is_raw_string())
-    return true;
+  if (message[key_pex_added].is_raw_string())
+    m_download->peer_list()->insert_pex_list(message[key_pex_added].as_raw_string());
 
-  m_download->peer_list()->insert_pex_list(message[key_pex_added].as_raw_string());
+  if (message[key_pex_added6].is_raw_string())
+    m_download->peer_list()->insert_pex_list6(message[key_pex_added6].as_raw_string());
+
   return true;
 }
 
@@ -345,6 +380,19 @@ ProtocolExtension::parse_ut_metadata() {
   return true;
 }
 
+size_t
+ProtocolExtension::metadata_piece_length(size_t piece, size_t metadata_size) {
+  size_t offset = piece << metadata_piece_shift;
+
+  if (offset >= metadata_size)
+    return 0;
+
+  if (metadata_size - offset < metadata_piece_size)
+    return metadata_size - offset;
+
+  return metadata_piece_size;
+}
+
 void
 ProtocolExtension::send_metadata_piece(size_t piece) {
   // Reject out-of-range piece, or if we don't have the complete metadata yet.
@@ -354,7 +402,7 @@ ProtocolExtension::send_metadata_piece(size_t piece) {
   if (m_download->info()->is_meta_download() || piece >= pieceEnd) {
     // reject: { "msg_type" => 2, "piece" => ... }
     m_pendingType = UT_METADATA;
-    m_pending = build_bencode(sizeof(size_t) + 36, "d8:msg_typei2e5:piecei%zuee", piece);
+    m_pending = build_bencode(64, "d8:msg_typei2e5:piecei%zuee", piece);
     return;
   }
 
@@ -365,7 +413,7 @@ ProtocolExtension::send_metadata_piece(size_t piece) {
                          &(*manager->download_manager()->find(m_download->info()))->bencode()->get_key("info"));
 
   // data: { "msg_type" => 1, "piece" => ..., "total_size" => ... } followed by piece data (outside of dictionary)
-  size_t length = piece == pieceEnd - 1 ? m_download->info()->metadata_size() % metadata_piece_size : metadata_piece_size;
+  size_t length = metadata_piece_length(piece, metadataSize);
   m_pendingType = UT_METADATA;
   m_pending = build_bencode((2 * sizeof(size_t)) + length + 120, "d8:msg_typei1e5:piecei%zue10:total_sizei%zuee", piece, metadataSize);
 

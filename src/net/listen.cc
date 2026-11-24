@@ -2,6 +2,8 @@
 
 #include "listen.h"
 
+#include <utility>
+
 #include "manager.h"
 #include "protocol/handshake.h"
 #include "torrent/exceptions.h"
@@ -10,7 +12,9 @@
 #include "torrent/runtime/network_manager.h"
 #include "torrent/runtime/socket_manager.h"
 #include "torrent/system/poll.h"
+#include "torrent/system/scheduler.h"
 #include "torrent/system/types.h"
+#include "torrent/utils/functional.h"
 #include "torrent/utils/log.h"
 
 #define LT_LOG(log_fmt, ...)                                    \
@@ -21,7 +25,7 @@ namespace torrent {
 namespace {
 
 std::tuple<int, int>
-listen_fd_open(const sockaddr* bind_address, bool block_ipv4in6) {
+listen_fd_open(const sockaddr* bind_address, const std::string& device_name, bool block_ipv4in6, bool check_dht) {
   fd_flags open_flags = fd_flag_nonblock | fd_flag_reuse_address;
 
   if (bind_address->sa_family == AF_INET)
@@ -35,21 +39,35 @@ listen_fd_open(const sockaddr* bind_address, bool block_ipv4in6) {
   if (stream_fd == -1)
     throw resource_error("Could not open stream socket for listening: " + system::errno_enum_str(errno));
 
-  int datagram_fd = fd_open(fd_flag_datagram | open_flags);
+  // Only the DHT port check uses a datagram socket. Without one, reopening a listener on the same
+  // port needs no more descriptors than closing it released.
+  int datagram_fd{-1};
 
-  if (datagram_fd == -1) {
+  if (check_dht) {
+    datagram_fd = fd_open(fd_flag_datagram | open_flags);
+
+    if (datagram_fd == -1) {
+      fd_close(stream_fd);
+      throw resource_error("Could not open datagram socket for listening: " + system::errno_enum_str(errno));
+    }
+  }
+
+  if (!device_name.empty() &&
+      (!fd_bind_to_device(stream_fd, device_name.c_str(), bind_address->sa_family) ||
+       (check_dht && !fd_bind_to_device(datagram_fd, device_name.c_str(), bind_address->sa_family)))) {
     fd_close(stream_fd);
-    throw resource_error("Could not open datagram socket for listening: " + system::errno_enum_str(errno));
+    fd_close_and_clear_if_open(datagram_fd);
+    throw resource_error("Could not bind listening sockets to device: " + device_name + " : " + system::errno_enum_str(errno));
   }
 
   return std::make_tuple(stream_fd, datagram_fd);
 }
 
 std::tuple<int, uint16_t>
-listen_open_range(Listen::open_options options, const sockaddr* bind_address) {
+listen_open_range(Listen::open_options options, const sockaddr* bind_address, const std::string& device_name) {
   sa_unique_ptr try_address = sa_copy(bind_address);
 
-  auto [stream_fd, datagram_fd] = listen_fd_open(bind_address, options.block_ipv4in6);
+  auto [stream_fd, datagram_fd] = listen_fd_open(bind_address, device_name, options.block_ipv4in6, options.check_dht);
 
   uint16_t port = options.first_port;
 
@@ -66,25 +84,56 @@ listen_open_range(Listen::open_options options, const sockaddr* bind_address) {
       fd_close(stream_fd);
       fd_close(datagram_fd);
 
-      std::tie(stream_fd, datagram_fd) = listen_fd_open(bind_address, options.block_ipv4in6);
+      std::tie(stream_fd, datagram_fd) = listen_fd_open(bind_address, device_name, options.block_ipv4in6, options.check_dht);
       continue;
     }
 
-    fd_close(datagram_fd);
+    fd_close_and_clear_if_open(datagram_fd);
     return std::make_tuple(stream_fd, port);
 
   } while (port++ < options.last_port);
 
   fd_close(stream_fd);
-  fd_close(datagram_fd);
+  fd_close_and_clear_if_open(datagram_fd);
 
   return std::make_tuple(-1, 0);
+}
+
+// Linux passes errors already pending on the new connection to accept(), and a firewall rule
+// refusing it gives EPERM: the connection is gone, the listening socket is fine.
+bool
+accept_error_is_connection(int error) {
+  switch (error) {
+  case ECONNABORTED:
+  case EPERM:
+  case EPROTO:
+  case ENOPROTOOPT:
+  case EOPNOTSUPP:
+  case ENETDOWN:
+  case ENETUNREACH:
+  case EHOSTDOWN:
+  case EHOSTUNREACH:
+#ifdef ENONET
+  case ENONET:
+#endif
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Out of file descriptors or memory: the connection stays queued and the socket stays readable.
+bool
+accept_error_is_resource(int error) {
+  return error == EMFILE || error == ENFILE || error == ENOBUFS || error == ENOMEM;
 }
 
 }
 
 bool
-Listen::open_single(Listen* listen, const sockaddr* bind_address, open_options options) {
+Listen::open_single(listen_info listen_info, open_options options) {
+  auto [listen, bind_address, device_name] = listen_info;
+
   listen->close();
 
   if (options.first_port == 0 || options.first_port > options.last_port)
@@ -93,7 +142,7 @@ Listen::open_single(Listen* listen, const sockaddr* bind_address, open_options o
   if (bind_address->sa_family != AF_INET && bind_address->sa_family != AF_INET6)
     throw input_error("Listening socket must be inet or inet6 address type");
 
-  auto [listen_fd, listen_port] = listen_open_range(options, bind_address);
+  auto [listen_fd, listen_port] = listen_open_range(options, bind_address, device_name);
 
   if (listen_fd == -1) {
     LT_LOG("failed to find a suitable listen port : options.last_port error : %s", system::errno_enum(errno));
@@ -118,7 +167,10 @@ Listen::open_single(Listen* listen, const sockaddr* bind_address, open_options o
 }
 
 bool
-Listen::open_both(Listen* listen_inet, Listen* listen_inet6, const sockaddr* bind_inet_address, const sockaddr* bind_inet6_address, open_options options) {
+Listen::open_both(listen_info listen4, listen_info listen6, open_options options) {
+  auto [listen_inet,  bind_inet_address,  bind_inet_device_name]  = listen4;
+  auto [listen_inet6, bind_inet6_address, bind_inet6_device_name] = listen6;
+
   listen_inet->close();
   listen_inet6->close();
 
@@ -131,8 +183,15 @@ Listen::open_both(Listen* listen_inet, Listen* listen_inet6, const sockaddr* bin
   if (bind_inet6_address->sa_family != AF_INET6)
     throw input_error("Listening ipv6 socket must be inet6 address type");
 
-  int      inet_fd{},   inet6_fd{};
+  int      inet_fd{-1}, inet6_fd{-1};
   uint16_t inet_port{}, inet6_port{};
+
+  // Every exit before a socket is handed over closes it, including the ipv4
+  // socket left open when the ipv6 open throws.
+  utils::scope_guard close_pending([&]() {
+    fd_close_and_clear_if_open(inet_fd);
+    fd_close_and_clear_if_open(inet6_fd);
+  });
 
   while (true) {
     if (options.first_port > options.last_port) {
@@ -140,7 +199,7 @@ Listen::open_both(Listen* listen_inet, Listen* listen_inet6, const sockaddr* bin
       return false;
     }
 
-    std::tie(inet_fd, inet_port) = listen_open_range(options, bind_inet_address);
+    std::tie(inet_fd, inet_port) = listen_open_range(options, bind_inet_address, bind_inet_device_name);
 
     if (inet_fd == -1) {
       LT_LOG("Unable to find a suitable ipv4 listen port : options.last_port error : %s", system::errno_enum(errno));
@@ -148,49 +207,44 @@ Listen::open_both(Listen* listen_inet, Listen* listen_inet6, const sockaddr* bin
     }
 
     auto inet6_options = options;
-    options.first_port = inet_port;
-    options.last_port = inet_port;
+    inet6_options.first_port = inet_port;
+    inet6_options.last_port = inet_port;
 
-    std::tie(inet6_fd, inet6_port) = listen_open_range(inet6_options, bind_inet6_address);
+    std::tie(inet6_fd, inet6_port) = listen_open_range(inet6_options, bind_inet6_address, bind_inet6_device_name);
 
     if (inet6_fd != -1)
       break;
 
-    fd_close(inet_fd);
+    fd_close_and_clear(inet_fd);
     options.first_port = inet_port + 1;
 
     LT_LOG("Unable to find a suitable ipv6 listen port matching ipv4 port %" PRIu16 " : options.last_port error : %s", inet_port, system::errno_enum(errno));
   }
 
-  try {
-    auto error_fn = [](std::string msg) {
-        LT_LOG("%s : %s", msg.c_str(), system::errno_enum(errno));
-        throw resource_error(msg + ": " + std::string(strerror(errno)));
-      };
+  auto error_fn = [](std::string msg) {
+      LT_LOG("%s : %s", msg.c_str(), system::errno_enum(errno));
+      throw resource_error(msg + ": " + std::string(strerror(errno)));
+    };
 
 
-    if (inet_port != inet6_port)
-      throw internal_error("Listen::open_both(): ipv4 and ipv6 ports do not match.");
+  if (inet_port != inet6_port)
+    throw internal_error("Listen::open_both(): ipv4 and ipv6 ports do not match.");
 
-    if (!fd_listen(inet_fd, options.backlog))
-      error_fn("Could not listen on ipv4 socket");
+  if (!fd_listen(inet_fd, options.backlog))
+    error_fn("Could not listen on ipv4 socket");
 
-    if (!fd_listen(inet6_fd, options.backlog))
-      error_fn("Could not listen on ipv6 socket");
-
-  } catch (...) {
-    if (inet_fd != -1)
-      fd_close(inet_fd);
-
-    fd_close(inet6_fd);
-    throw;
-  }
+  if (!fd_listen(inet6_fd, options.backlog))
+    error_fn("Could not listen on ipv6 socket");
 
   if (inet_fd != -1)
-    listen_inet->open_done(inet_fd, inet_port, options.backlog);
+    listen_inet->open_done(std::exchange(inet_fd, -1), inet_port, options.backlog);
 
-  listen_inet6->open_done(inet6_fd, inet_port, options.backlog);
+  listen_inet6->open_done(std::exchange(inet6_fd, -1), inet_port, options.backlog);
   return true;
+}
+
+Listen::Listen() {
+  m_resume_accept.slot() = [this] { resume_accept(); };
 }
 
 void
@@ -210,11 +264,12 @@ void Listen::close() {
   if (!is_open())
     return;
 
+  this_thread::scheduler()->erase(&m_resume_accept);
+
   runtime::socket_manager()->unregister_event_or_throw(this, [this]() {
       this_thread::poll()->remove_and_close(this);
 
-      fd_close(file_descriptor());
-      reset_file_descriptor();
+      fd_close_and_clear(file_descriptor_ref());
     });
 
   m_port = 0;
@@ -238,8 +293,14 @@ Listen::event_read() {
         return;
 
       // Force a new event_read() call just to be sure we don't enter an infinite loop.
-      if (errno == ECONNABORTED)
+      if (accept_error_is_connection(errno))
         return;
+
+      // Stop reading the socket for a while, else the queued connection makes it readable again at once.
+      if (accept_error_is_resource(errno)) {
+        pause_accept(errno);
+        return;
+      }
 
       throw resource_error("Listener port accept() failed: " + system::errno_enum_str(errno));
     }
@@ -275,6 +336,23 @@ Listen::event_read() {
     if (!result)
       return;
   }
+}
+
+void
+Listen::pause_accept(int error) {
+  lt_log_print(LOG_ERRORS, "listen: accept() failed on port %" PRIu16 " : %s : not accepting connections for a second",
+               m_port, system::errno_enum_str(error).c_str());
+
+  this_thread::poll()->remove_read(this);
+  this_thread::scheduler()->update_wait_for(&m_resume_accept, 1s);
+}
+
+void
+Listen::resume_accept() {
+  if (!is_open())
+    return;
+
+  this_thread::poll()->insert_read(this);
 }
 
 void

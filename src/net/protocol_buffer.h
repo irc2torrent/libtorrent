@@ -46,12 +46,6 @@ public:
   template <typename Out>
   void                read_len(Out start, unsigned int len);
 
-  template <typename T>
-  inline T            read_int();
-
-  template <typename T>
-  inline T            peek_int();
-
   void                write_8(uint8_t v)            { *m_end++ = v; validate_end(); }
   void                write_16(uint16_t v);
   void                write_32(uint32_t v);
@@ -104,6 +98,9 @@ private:
 template <uint16_t tmpl_size>
 inline bool
 ProtocolBuffer<tmpl_size>::consume(difference_type v) {
+  if (v < 0 || v > remaining())
+    throw internal_error("ProtocolBuffer::consume(...) called with an out of range length.");
+
   m_position += v;
 
   if (remaining())

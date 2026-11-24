@@ -13,7 +13,7 @@
 #include "torrent/utils/log.h"
 
 #define LT_LOG_ERROR(log_fmt, ...)                                      \
-  lt_log_print(LOG_STORAGE, "socket_file->%i: " log_fmt, m_fd, __VA_ARGS__);
+  lt_log_print(LOG_STORAGE_ERRORS, "socket_file : fd:%i " log_fmt, m_fd, __VA_ARGS__);
 
 namespace torrent {
 
@@ -125,7 +125,7 @@ SocketFile::create_padding_chunk(uint32_t length, int prot, int flags) {
   if (ptr == MAP_FAILED)
     return MemoryChunk();
 
-  return MemoryChunk(ptr, ptr, ptr + length, prot, flags);
+  return MemoryChunk(ptr, ptr, ptr + length, prot);
 }
 
 MemoryChunk
@@ -152,7 +152,7 @@ SocketFile::create_chunk(uint64_t offset, uint32_t length, int prot, int flags) 
   if (ptr == MAP_FAILED)
     return MemoryChunk();
 
-  return MemoryChunk(ptr, ptr + align, ptr + align + length, prot, flags);
+  return MemoryChunk(ptr, ptr + align, ptr + align + length, prot);
 }
 
 } // namespace torrent

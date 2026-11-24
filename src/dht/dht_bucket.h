@@ -61,8 +61,8 @@ public:
   // Called every 15 minutes after updating nodes.
   void                update();
 
-  // Return candidate for replacement (a bad node or the oldest node); may
-  // return end() unless has_space() is true.
+  // Return candidate for replacement (a bad node or the oldest node); returns
+  // end() only when the bucket is empty.
   iterator            find_replacement_candidate(bool onlyOldest = false);
 
   // Split the bucket in two and redistribute nodes. Returned bucket is the
@@ -105,7 +105,8 @@ private:
   HashString          m_begin;
   HashString          m_end;
 
-  char                m_fullCache[num_nodes * 26];
+  // Room for a reply's worth of IPv6 nodes (38 bytes each, BEP 32); an IPv4 bucket fills 26 bytes a node.
+  char                m_fullCache[num_nodes * 38];
 };
 
 // Helper class to recursively follow a chain of buckets.  It first recurses

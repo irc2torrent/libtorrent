@@ -11,13 +11,17 @@
 
 namespace torrent::dht {
 
-DhtAnnounce::DhtAnnounce(DhtServer* server, const HashString& infoHash, std::weak_ptr<TrackerDht> tracker)
+DhtAnnounce::DhtAnnounce(DhtServer* server, const HashString& infoHash, std::weak_ptr<TrackerDht> tracker, bool primary)
   : DhtSearch(server, infoHash),
-    m_tracker(tracker) {
+    m_tracker(tracker),
+    m_primary(primary) {
 }
 
 DhtAnnounce::~DhtAnnounce() {
   assert(complete() && "DhtAnnounce::~DhtAnnounce called while announce not complete.");
+
+  if (!m_primary)
+    return;
 
   TrackerDht::add_event(m_tracker, [contacted = m_contacted, replied = m_replied](TrackerDht* tracker) {
       const char* failure = nullptr;
@@ -42,27 +46,40 @@ DhtAnnounce::~DhtAnnounce() {
     });
 }
 
-DhtSearch::const_accessor
+std::vector<DhtAnnounce::announce_target>
 DhtAnnounce::start_announce() {
   trim(true);
 
   if (empty())
-    return end();
+    return {};
 
-  if (!complete() || m_next != end() || size() > DhtBucket::num_nodes)
+  if (!complete() || m_next != end() || size() > max_announce)
     throw internal_error("DhtSearch::start_announce called in inconsistent state.");
 
-  m_contacted = m_pending = size();
-  m_replied = 0;
+  std::vector<announce_target> targets;
 
-  TrackerDht::add_event(m_tracker, [](TrackerDht* tracker) {
-      tracker->set_dht_announce_state();
-    });
+  for (const auto& node : *this) {
+    auto itr = m_tokens.find(node->id());
 
-  for (const auto& [node, _] : *this)
-    set_node_active(node, true);
+    if (itr != m_tokens.end())
+      targets.emplace_back(node.get(), raw_string(itr->second.data(), itr->second.size()));
+  }
 
-  return const_accessor(begin());
+  if (targets.empty())
+    return {};
+
+  if (m_primary) {
+    TrackerDht::add_event(m_tracker, [](TrackerDht* tracker) {
+        tracker->set_dht_announce_state();
+      });
+  }
+
+  return targets;
+}
+
+void
+DhtAnnounce::set_token(const HashString& id, raw_string token) {
+  m_tokens[id].assign(token.data(), token.size());
 }
 
 void
@@ -77,6 +94,9 @@ DhtAnnounce::receive_peers(raw_list peers) {
 
 void
 DhtAnnounce::update_status() {
+  if (!m_primary)
+    return;
+
   TrackerDht::add_event(m_tracker, [contacted = m_contacted, replied = m_replied](TrackerDht* tracker) {
       tracker->receive_progress(replied, contacted);
     });

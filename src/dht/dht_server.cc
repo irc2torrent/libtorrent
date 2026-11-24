@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 #include "manager.h"
 #include "dht/dht_bucket.h"
@@ -24,7 +25,7 @@
 #include "tracker/tracker_dht.h"
 
 #define LT_LOG_THIS(log_fmt, ...)                                       \
-  lt_log_print_subsystem(torrent::LOG_DHT_SERVER, "dht_server", log_fmt, __VA_ARGS__);
+  lt_log_print(LOG_DHT_SERVER, "dht_server : " log_fmt, __VA_ARGS__);
 
 namespace {
 
@@ -64,6 +65,7 @@ const DhtMessage::key_list_type DhtMessage::base_type::keys = {
 
   { key_r_id,       "r::id*S" },
   { key_r_nodes,    "r::nodes*S" },
+  { key_r_nodes6,   "r::nodes6*S" },
   { key_r_token,    "r::token*S" },
   { key_r_values,   "r::values*L" },
 
@@ -75,7 +77,6 @@ const DhtMessage::key_list_type DhtMessage::base_type::keys = {
 DhtServer::DhtServer(DhtRouter* router)
   : m_router(router) {
 
-  reset_file_descriptor();
   reset_statistics();
 
   m_task_timeout.slot() = [this] { receive_timeout(); };
@@ -87,25 +88,39 @@ DhtServer::~DhtServer() {
 
 void
 DhtServer::start(int port) {
-  auto [bind_inet_address, bind_inet6_address] = runtime::network_config()->bind_udp_addresses_or_null();
+  auto [inet_address, inet_device, inet6_address, inet6_device] = runtime::network_config()->bind_udp_addresses_or_null();
 
-  if (bind_inet_address == nullptr)
-    throw resource_error("no valid bind address for DHT server");
+  // The IPv6 server (BEP 32) binds the inet6 address, or any, v6-only; a null address means IPv6 (or UDP) is
+  // blocked in the network config.
+  bool is_inet6 = m_router->family() == AF_INET6;
+  auto family_address = is_inet6 ? inet6_address : inet_address;
+  auto family_device  = is_inet6 ? inet6_device : inet_device;
+
+  if (family_address == nullptr)
+    throw resource_error(is_inet6 ? "no valid inet6 bind address for DHT server" : "no valid bind address for DHT server");
 
   sa_unique_ptr bind_address;
+  std::string   bind_device;
 
-  switch (bind_inet_address->sa_family) {
+  switch (family_address->sa_family) {
   case AF_INET:
-    bind_address = sa_copy(bind_inet_address.get());
+  case AF_INET6:
+    if (family_address->sa_family != m_router->family())
+      throw resource_error("invalid address family for DHT server");
+
+    bind_address = sa_copy(family_address.get());
+    bind_device  = family_device;
     break;
   case AF_UNSPEC:
-    bind_address = sa_make_inet_any();
+    bind_address = is_inet6 ? sa_make_inet6_any() : sa_make_inet_any();
+    bind_device  = family_device;
     break;
   default:
     throw resource_error("invalid address family for DHT server");
   }
 
-  m_router->set_address(bind_inet_address.get());
+  m_router->set_address(bind_address.get());
+
   sap_set_port(bind_address, port);
 
   LT_LOG_THIS("starting server : %s", sap_pretty_str(bind_address).c_str());
@@ -114,18 +129,24 @@ DhtServer::start(int port) {
 
   if (bind_address->sa_family == AF_INET)
     open_flags |= fd_flag_v4;
+  else
+    open_flags |= fd_flag_v6only;
 
   int fd = fd_open(open_flags);
 
   if (fd == -1) {
     LT_LOG_THIS("could not open datagram socket : %s", std::strerror(errno));
-
     throw resource_error("could not open datagram socket : " + std::string(strerror(errno)));
+  }
+
+  if (!bind_device.empty() && !fd_bind_to_device(fd, bind_device.c_str(), bind_address->sa_family)) {
+    LT_LOG_THIS("could not bind datagram socket to device : %s : %s", bind_device.c_str(), std::strerror(errno));
+    fd_close(fd);
+    throw resource_error("could not bind datagram socket to device : " + bind_device + " : " + std::string(strerror(errno)));
   }
 
   if (!fd_bind(fd, bind_address.get())) {
     LT_LOG_THIS("could not bind datagram socket : %s", std::strerror(errno));
-
     fd_close(fd);
     throw resource_error("could not bind datagram socket : " + std::string(strerror(errno)));
   }
@@ -155,8 +176,7 @@ DhtServer::stop() {
   runtime::socket_manager()->close_event_or_throw(this, [this]() {
       this_thread::poll()->remove_and_close(this);
 
-      fd_close(file_descriptor());
-      reset_file_descriptor();
+      fd_close_and_clear(file_descriptor_ref());
     });
 
   m_networkUp = false;
@@ -177,6 +197,9 @@ DhtServer::ping(const HashString& id, const sockaddr* sa) {
   if (m_transactions.size() >= max_transactions)
     return;
 
+  if (!sa_is_inet(sa) && !sa_is_inet6(sa))
+    return;
+
   // No point pinging a node that we're already contacting otherwise.
   auto itr = m_transactions.lower_bound(DhtTransaction::key(sa, 0));
 
@@ -193,7 +216,7 @@ DhtServer::find_node(const DhtBucket& contacts, const HashString& target) {
   auto n = search->get_contact();
 
   while (n != search->end()) {
-    add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionFindNode(n)), packet_prio_low);
+    add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionFindNode(search, n)), packet_prio_low);
     n = search->get_contact();
   }
 
@@ -206,14 +229,14 @@ DhtServer::find_node(const DhtBucket& contacts, const HashString& target) {
 }
 
 void
-DhtServer::announce(const DhtBucket& contacts, const HashString& infoHash, std::weak_ptr<TrackerDht> tracker) {
-  auto announce = std::make_shared<dht::DhtAnnounce>(this, infoHash, tracker);
+DhtServer::announce(const DhtBucket& contacts, const HashString& infoHash, std::weak_ptr<TrackerDht> tracker, bool primary) {
+  auto announce = std::make_shared<dht::DhtAnnounce>(this, infoHash, tracker, primary);
   announce->add_contacts(contacts);
 
   auto n = announce->get_contact();
 
   while (n != announce->end()) {
-    add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionFindNode(n)), packet_prio_high);
+    add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionGetPeers(announce, n)), packet_prio_high);
     n = announce->get_contact();
   }
 
@@ -327,9 +350,11 @@ DhtServer::create_find_node_response(const DhtMessage& req, DhtMessage& reply) {
   if (target.size() < HashString::size_data)
     throw dht_error(dht_error_protocol, "target string too short");
 
-  reply[key_r_nodes] = m_router->get_closest_nodes(*HashString::cast_from(target.data()));
+  auto nodes_key = m_router->family() == AF_INET6 ? key_r_nodes6 : key_r_nodes;
 
-  if (reply[key_r_nodes].as_raw_string().empty())
+  reply[nodes_key] = m_router->get_closest_nodes(*HashString::cast_from(target.data()));
+
+  if (reply[nodes_key].as_raw_string().empty())
     throw dht_error(dht_error_generic, "No nodes");
 }
 
@@ -354,7 +379,10 @@ DhtServer::create_get_peers_response(const DhtMessage& req, const sockaddr* sa, 
     if (nodes.empty())
       throw dht_error(dht_error_generic, "No peers nor nodes");
 
-    reply[key_r_nodes] = nodes;
+    reply[m_router->family() == AF_INET6 ? key_r_nodes6 : key_r_nodes] = nodes;
+
+  } else if (m_router->family() == AF_INET6) {
+    reply[key_r_values] = tracker->get_peers6();
 
   } else {
     reply[key_r_values] = tracker->get_peers();
@@ -371,12 +399,33 @@ DhtServer::create_announce_peer_response(const DhtMessage& req, const sockaddr* 
   if (!m_router->token_valid(req[key_a_token].as_raw_string(), sa))
     throw dht_error(dht_error_protocol, "Token invalid.");
 
-  if (!sa_is_inet(sa))
+  if (!req[key_a_port].is_value())
+    throw dht_error(dht_error_protocol, "Port missing.");
+
+  auto port = req[key_a_port].as_value();
+
+  if (port <= 0 || port > 65535)
+    throw dht_error(dht_error_protocol, "Port invalid.");
+
+  if (sa_is_inet(sa)) {
+    DhtTracker* tracker = m_router->get_tracker(*HashString::cast_from(info_hash.data()), true);
+
+    if (tracker == NULL)
+      throw dht_error(dht_error_generic, "Tracking too many info hashes");
+
+    tracker->add_peer(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr, port);
+
+  } else if (sa_is_inet6(sa)) {
+    DhtTracker* tracker = m_router->get_tracker(*HashString::cast_from(info_hash.data()), true);
+
+    if (tracker == NULL)
+      throw dht_error(dht_error_generic, "Tracking too many info hashes");
+
+    tracker->add_peer6(reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr, port);
+
+  } else {
     throw internal_error("DhtServer::create_announce_peer_response called with non-inet address.");
-
-  DhtTracker* tracker = m_router->get_tracker(*HashString::cast_from(info_hash.data()), true);
-
-  tracker->add_peer(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr, req[key_a_port].as_value());
+  }
 }
 
 void
@@ -405,13 +454,24 @@ DhtServer::process_response(const HashString& id, const sockaddr* sa, const DhtM
 #endif
 
     // If we contact a node but its ID is not the one we expect, ignore the reply
-    // to prevent interference from rogue nodes.
+    // to prevent interference from rogue nodes. An IPv6 key folds the address, so the address is checked too.
     if ((id != transaction->id() && transaction->id() != torrent::DhtRouter::zero_id))
+      return;
+
+    if (!sa_equal_addr(transaction->address(), sa))
       return;
 
     switch (transaction->type()) {
       case DhtTransaction::DHT_FIND_NODE:
-        parse_find_node_reply(transaction->as_find_node(), response[key_r_nodes].as_raw_string());
+        // the get_peers walk of an announce: the peers a node on the way holds go to the tracker at once
+        if (transaction->as_find_node()->search()->is_announce() && response[key_r_values].is_raw_list()) {
+          auto announce = dynamic_cast<dht::DhtAnnounce*>(transaction->as_find_node()->search().get());
+
+          if (announce != nullptr)
+            announce->receive_peers(response[key_r_values].as_raw_list());
+        }
+
+        parse_find_node_reply(transaction->as_find_node(), response);
         break;
 
       case DhtTransaction::DHT_GET_PEERS:
@@ -459,23 +519,57 @@ DhtServer::process_error(const sockaddr* sa, const DhtMessage& error) {
 }
 
 void
-DhtServer::parse_find_node_reply(DhtTransactionSearch* transaction, raw_string nodes) {
+DhtServer::parse_find_node_reply(DhtTransactionSearch* transaction, const DhtMessage& response) {
   transaction->complete(true);
 
-  if (sizeof(const compact_node_info) != 26)
-    throw internal_error("DhtServer::parse_find_node_reply(...) bad struct size.");
-
-  node_info_list list;
-  std::copy(reinterpret_cast<const compact_node_info*>(nodes.data()),
-            reinterpret_cast<const compact_node_info*>(nodes.data() + nodes.size() - nodes.size() % sizeof(compact_node_info)),
-            std::back_inserter(list));
-
-  for (auto& node : list) {
-    if (node.id() != m_router->id())
-      transaction->search()->add_contact(node.id(), sa_make_inet_n(node._addr.addr, node._addr.port).get());
-  }
-
+  add_search_contacts(transaction, response);
   find_node_next(transaction);
+}
+
+void
+DhtServer::add_search_contacts(DhtTransactionSearch* transaction, const DhtMessage& response) {
+  if (sizeof(const compact_node_info) != 26)
+    throw internal_error("DhtServer::add_search_contacts(...) bad struct size.");
+
+  if (m_router->family() == AF_INET6) {
+    if (response[key_r_nodes6].is_raw_string()) {
+      raw_string nodes = response[key_r_nodes6].as_raw_string();
+
+      for (auto itr = nodes.data(); itr + 38 <= nodes.data() + nodes.size(); itr += 38) {
+        const HashString* node_id = HashString::cast_from(itr);
+
+        if (*node_id == m_router->id())
+          continue;
+
+        auto sin6 = sin6_make_n(itr + 20, *reinterpret_cast<const uint16_t*>(itr + 36));
+
+        // a v4-mapped entry is an IPv4 node in disguise: not this table's
+        if (sin6_is_v4mapped(sin6.get()) || sin6_is_any(sin6.get()) || sin6->sin6_port == 0)
+          continue;
+
+        transaction->search()->add_contact(*node_id, sa_from_in6(std::move(sin6)).get());
+      }
+    }
+
+  } else {
+    if (response[key_r_nodes].is_raw_string()) {
+      raw_string nodes = response[key_r_nodes].as_raw_string();
+
+      for (auto itr = nodes.data(); itr + 26 <= nodes.data() + nodes.size(); itr += 26) {
+        const HashString* node_id = HashString::cast_from(itr);
+
+        if (*node_id == m_router->id())
+          continue;
+
+        auto sin = sin_make_n(*reinterpret_cast<const uint32_t*>(itr + 20), *reinterpret_cast<const uint16_t*>(itr + 24));
+
+        if (sin_is_any(sin.get()) || sin->sin_port == 0)
+          continue;
+
+        transaction->search()->add_contact(*node_id, sa_from_in(std::move(sin)).get());
+      }
+    }
+  }
 }
 
 void
@@ -490,14 +584,16 @@ DhtServer::parse_get_peers_reply(DhtTransactionGetPeers* transaction, const DhtM
   if (response[key_r_values].is_raw_list())
     announce->receive_peers(response[key_r_values].as_raw_list());
 
-  if (response[key_r_token].is_raw_string())
-    add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionAnnouncePeer(transaction->id(),
-                                                                                   transaction->address(),
-                                                                                   announce->target(),
-                                                                                   response[key_r_token].as_raw_string())),
-                    packet_prio_low);
+  // Restrict the length of tokens. We echo them back in announce_peer, and the query has to fit in
+  // a single packet.
+  //
+  // A reply with a longer token still carries nodes for the walk.
+  if (response[key_r_token].is_raw_string() && response[key_r_token].as_raw_string().size() <= 64)
+    announce->set_token(transaction->id(), response[key_r_token].as_raw_string());
 
-  announce->update_status();
+  add_search_contacts(transaction, response);
+
+  find_node_next(transaction);
 }
 
 void
@@ -510,7 +606,11 @@ DhtServer::find_node_next(DhtTransactionSearch* transaction) {
   auto node = transaction->search()->get_contact();
 
   while (node != transaction->search()->end()) {
-    add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionFindNode(node)), priority);
+    if (transaction->search()->is_announce())
+      add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionGetPeers(transaction->search(), node)), priority);
+    else
+      add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionFindNode(transaction->search(), node)), priority);
+
     node = transaction->search()->get_contact();
   }
 
@@ -523,10 +623,9 @@ DhtServer::find_node_next(DhtTransactionSearch* transaction) {
     throw internal_error("DhtServer::find_node_next dynamic_cast to DhtAnnounce failed.");
 
   if (announce->complete()) {
-    // We have found the 8 closest nodes to the info hash. Retrieve peers
-    // from them and announce to them.
-    for (node = announce->start_announce(); node != announce->end(); ++node)
-      add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionGetPeers(node)), packet_prio_high);
+    // We have found the 8 closest nodes to the info hash, announce to them.
+    for (const auto& [node, token] : announce->start_announce())
+      add_transaction(std::unique_ptr<DhtTransaction>(new DhtTransactionAnnouncePeer(node->id(), node->address(), announce->target(), token)), packet_prio_high);
   }
 
   announce->update_status();
@@ -596,7 +695,14 @@ DhtServer::create_query(transaction_itr itr, int tID, [[maybe_unused]] const soc
       break;
 
     case DhtTransaction::DHT_FIND_NODE:
-      query[key_a_target] = transaction->as_find_node()->search()->target_raw_string();
+      // A peer search walks with get_peers (BEP 5): every node on the way may hold the info-hash's peers and
+      // answers with them beside the closer nodes; a find_node walk only asked the last few nodes for peers.
+      if (transaction->as_find_node()->search()->is_announce()) {
+        query[key_q] = raw_string::from_c_str("get_peers");
+        query[key_a_infoHash] = transaction->as_find_node()->search()->target_raw_string();
+      } else {
+        query[key_a_target] = transaction->as_find_node()->search()->target_raw_string();
+      }
       break;
 
     case DhtTransaction::DHT_GET_PEERS:
@@ -610,7 +716,7 @@ DhtServer::create_query(transaction_itr itr, int tID, [[maybe_unused]] const soc
       break;
   }
 
-  auto packet = std::make_shared<DhtTransactionPacket>(transaction->address(), query, tID, transaction);
+  auto packet = std::make_shared<DhtTransactionPacket>(transaction->address(), query, tID, itr->first);
 
   transaction->set_packet(packet);
   add_packet(packet, priority);
@@ -645,6 +751,9 @@ DhtServer::create_error(const DhtMessage& req, const sockaddr* sa, int num, cons
 
 int
 DhtServer::add_transaction(std::shared_ptr<DhtTransaction> transaction, int priority) {
+  if (!sa_is_inet(transaction->address()) && !sa_is_inet6(transaction->address()))
+    return -1;
+
   // Try random transaction ID. This is to make it less likely that we reuse
   // a transaction ID from an earlier transaction which timed out and we forgot
   // about it, so that if the node replies after the timeout it's less likely
@@ -697,14 +806,14 @@ DhtServer::failed_transaction(transaction_itr itr, bool quick) {
   if (!quick && m_networkUp && transaction->packet() == NULL && transaction->id() != torrent::DhtRouter::zero_id)
     m_router->node_inactive(transaction->id(), transaction->address());
 
-  if (transaction->type() == DhtTransaction::DHT_FIND_NODE) {
+  if (transaction->type() == DhtTransaction::DHT_FIND_NODE || transaction->type() == DhtTransaction::DHT_GET_PEERS) {
     if (quick)
-      transaction->as_find_node()->set_stalled();
+      transaction->as_search()->set_stalled();
     else
-      transaction->as_find_node()->complete(false);
+      transaction->as_search()->complete(false);
 
     try {
-      find_node_next(transaction->as_find_node());
+      find_node_next(transaction->as_search());
 
     } catch (const std::exception&) {
       if (!quick) {
@@ -753,14 +862,14 @@ DhtServer::event_read() {
       if (read < 0)
         break;
 
-      // We can currently only process mapped-IPv4 addresses, not real IPv6.
-      // Translate them to an af_inet socket_address.
+      // The IPv4 server takes mapped-IPv4 addresses as IPv4; the IPv6 server (a v6-only socket) takes real IPv6
+      // only. Each family's traffic belongs to its own router.
       if (sa_is_v4mapped(sa)) {
         auto sa_unmapped = sin_from_v4mapped_in6(&sa_raw);
         *reinterpret_cast<sockaddr_in*>(&sa_raw) = *sa_unmapped.get();
       }
 
-      if (sa->sa_family != AF_INET)
+      if (sa->sa_family != m_router->family())
         continue;
 
       // If it's not a valid bencode dictionary at all, it's probably not a DHT
@@ -858,7 +967,7 @@ DhtServer::process_queue(packet_queue& queue) {
     DhtTransaction::key_type transactionKey = 0;
 
     if(packet->has_transaction())
-      transactionKey = packet->transaction()->key(packet->id());
+      transactionKey = packet->transaction_key();
 
     // Make sure its transaction hasn't timed out yet, if it has/had one
     // and don't bother sending non-transaction packets (replies) after
@@ -895,7 +1004,7 @@ DhtServer::process_queue(packet_queue& queue) {
       auto itr = m_transactions.find(transactionKey);
 
       if (itr != m_transactions.end())
-        packet->transaction()->reset_packet();
+        itr->second->reset_packet();
     }
   }
 }

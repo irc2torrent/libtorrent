@@ -14,7 +14,7 @@
 #include "torrent/utils/option_strings.h"
 
 #define LT_LOG(log_fmt, ...)                                            \
-  lt_log_print_hash(LOG_TRACKER_REQUESTS, info().info_hash, "tracker_dht", "%p : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
+  lt_log_print_hash(LOG_TRACKER_REQUESTS, info().info_hash, "%p : tracker_dht : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
 
 namespace torrent {
 
@@ -58,6 +58,8 @@ TrackerDht::send_event(tracker::TrackerParams params, tracker::TrackerState::eve
   update_requesting_state();
 
   runtime::network_manager()->dht_controller()->announce(info().info_hash, m_weak_tracker);
+
+  auto guard = lock_guard();
 
   state().set_normal_interval(20 * 60s);
   state().set_min_interval(0s);
@@ -121,7 +123,7 @@ TrackerDht::set_dht_announce_state() {
 
 void
 TrackerDht::receive_peers(AddressList&& address_list) {
-  LT_LOG("received peers : dht_state:%s replied:%d contacted:%d size:%" PRIu32,
+  LT_LOG("received peers : dht_state:%s replied:%d contacted:%d size:%zu",
          states[m_dht_state], m_replied.load(), m_contacted.load(), address_list.size());
 
   m_slot_new_peers(std::move(address_list));

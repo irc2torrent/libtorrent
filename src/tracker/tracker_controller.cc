@@ -9,7 +9,7 @@
 #include "tracker/tracker_list.h"
 
 #define LT_LOG_TRACKER_EVENTS(log_fmt, ...)                              \
-  lt_log_print_info(LOG_TRACKER_EVENTS, m_tracker_list->info(), "tracker_controller", log_fmt, __VA_ARGS__);
+  lt_log_print_info(LOG_TRACKER_EVENTS, m_tracker_list->info(), "tracker_controller : " log_fmt, __VA_ARGS__);
 
 namespace torrent {
 
@@ -26,25 +26,6 @@ TrackerController::update_timeout(uint32_t seconds_to_next) {
   }
 
   this_thread::scheduler()->update_wait_for_ceil_seconds(&m_task_timeout, std::chrono::seconds(seconds_to_next));
-}
-
-void
-TrackerController::update_timeout_next_to_request() {
-  auto itr = m_tracker_list->find_next_to_request(m_tracker_list->begin());
-
-  if (itr == m_tracker_list->end())
-    return;
-
-  std::chrono::seconds next_timeout{};
-
-  itr->lock_and_call_state([&next_timeout](auto& state) {
-      next_timeout = state.activity_time_next();
-    });
-
-  if (next_timeout <= this_thread::cached_seconds())
-    update_timeout(0);
-  else
-    update_timeout((next_timeout - this_thread::cached_seconds()).count());
 }
 
 inline tracker::TrackerState::event_enum
@@ -234,7 +215,7 @@ TrackerController::send_completed_event() {
   m_flags &= ~mask_send;
   m_flags |= flag_send_completed;
 
-  if (!(m_flags & flag_active) || !m_tracker_list->has_usable()) {
+  if (!(m_flags & flag_active) || !m_tracker_list->has_in_use()) {
     LT_LOG_TRACKER_EVENTS("sending completed event : queued", 0);
     return;
   }
@@ -548,7 +529,7 @@ TrackerController::receive_success(const tracker::Tracker& tracker, TrackerContr
 
   if ((m_flags & flag_requesting))
     update_timeout(30);
-  else if (!m_tracker_list->has_active()) {
+  else if (!m_tracker_list->has_active_not_scrape()) {
     std::chrono::seconds normal_interval;
 
     tracker.lock_and_call_state([&](const tracker::TrackerState& state) {

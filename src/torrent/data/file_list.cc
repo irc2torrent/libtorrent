@@ -22,8 +22,12 @@
 #include "torrent/utils/file_stat.h"
 #include "torrent/utils/log.h"
 
-#define LT_LOG_FL(log_level, log_fmt, ...)                              \
-  lt_log_print_data(LOG_STORAGE_##log_level, (&m_data), "file_list", log_fmt, __VA_ARGS__);
+#define LT_LOG_DEBUG(log_fmt, ...)                                      \
+  lt_log_print_hash(LOG_STORAGE_DEBUG, m_data.hash(), "file_list : " log_fmt, __VA_ARGS__);
+#define LT_LOG_EVENTS(log_fmt, ...)                                     \
+  lt_log_print_hash(LOG_STORAGE_EVENTS, m_data.hash(), "file_list : " log_fmt, __VA_ARGS__);
+#define LT_LOG_ERRORS(log_fmt, ...)                                     \
+  lt_log_print_hash(LOG_STORAGE_ERRORS, m_data.hash(), "file_list : " log_fmt, __VA_ARGS__);
 
 namespace torrent {
 
@@ -294,9 +298,6 @@ FileList::update_paths(iterator first, iterator last) {
 
 bool
 FileList::make_root_path() {
-  if (!is_open())
-    return false;
-
   return ::mkdir(m_root_dir.c_str(), 0777) == 0 || errno == EEXIST;
 }
 
@@ -352,6 +353,11 @@ FileList::initialize(uint64_t torrentSize, uint32_t chunkSize) {
   if (chunkSize == 0)
     throw internal_error("FileList::initialize() chunk_size() == 0.", data()->hash());
 
+  uint64_t chunk_count = torrentSize / chunkSize + (torrentSize % chunkSize != 0);
+
+  if (chunk_count > std::numeric_limits<Bitfield::size_type>::max())
+    throw input_error("Torrent has more chunks than the chunk index can address.");
+
   m_chunk_size = chunkSize;
   m_torrent_size = torrentSize;
   m_root_dir = ".";
@@ -380,23 +386,28 @@ void
 FileList::open(bool hashing, int flags) {
   using path_set = std::set<const char*, file_list_cstr_less>;
 
-  LT_LOG_FL(INFO, "Opening.", 0);
+  LT_LOG_EVENTS("open", 0);
 
   if (m_root_dir.empty())
     throw internal_error("FileList::open() m_root_dir.empty().", data()->hash());
 
+  // Rebuilt below by make_directory, so start from empty rather than
+  // depend on a preceding close().
+  m_indirect_links.clear();
   m_indirect_links.push_back(m_root_dir);
 
   Path lastPath;
   path_set pathSet;
 
-  auto itr = end();
+  const File* current_file = nullptr;
 
   try {
     if (!(flags & open_no_create) && !make_root_path())
       throw storage_error("Could not create directory '" + m_root_dir + "': " + std::strerror(errno));
 
     for (auto& entry : *this) {
+      current_file = entry.get();
+
       // We no longer consider it an error to open a previously opened
       // FileList as we now use the same function to create
       // non-existent files.
@@ -411,6 +422,9 @@ FileList::open(bool hashing, int flags) {
 
       // Update the path during open so that any changes to root dir
       // and file paths are properly handled.
+      if (entry->path()->empty())
+        throw storage_error("Empty filename is not allowed.");
+
       if (entry->path()->back().empty())
         entry->set_frozen_path(std::string());
       else
@@ -422,8 +436,6 @@ FileList::open(bool hashing, int flags) {
       if (entry->size_bytes() > m_max_file_size)
         throw storage_error("File exceedes the configured max file size.");
 
-      if (entry->path()->empty())
-        throw storage_error("Empty filename is not allowed.");
 
       // Handle directory creation outside of open_file, so we can do
       // it here if necessary.
@@ -450,10 +462,10 @@ FileList::open(bool hashing, int flags) {
 
     manager->file_manager()->close_files(*this);
 
-    if (itr == end()) {
-      LT_LOG_FL(ERROR, "Failed to prepare file list: %s", e.what());
+    if (current_file == nullptr) {
+      LT_LOG_ERRORS("failed to prepare file list : %s", e.what());
     } else {
-      LT_LOG_FL(ERROR, "Failed to prepare file '%s': %s", (*itr)->path()->as_string().c_str(), e.what());
+      LT_LOG_ERRORS("failed to prepare file : path:%s error:%s", current_file->path()->as_string().c_str(), e.what());
     }
 
     // Set to false here in case we tried to open the FileList for the
@@ -486,7 +498,7 @@ FileList::close() {
   if (!is_open())
     return;
 
-  LT_LOG_FL(INFO, "Closing.", 0);
+  LT_LOG_EVENTS("close", 0);
 
   for (auto& entry : *this)
     entry->unset_flags_protected(File::flag_active);
@@ -504,7 +516,7 @@ FileList::close_all_files() {
   if (!is_open())
     return;
 
-  LT_LOG_FL(INFO, "Closing all files.", 0);
+  LT_LOG_EVENTS("close all files", 0);
 
   manager->file_manager()->close_files(*this);
 }
@@ -650,12 +662,12 @@ FileList::create_chunk(uint64_t offset, uint32_t length, bool hashing, int prot)
 
 Chunk*
 FileList::create_chunk_index(uint32_t index, int prot) {
-  return create_chunk(static_cast<uint64_t>(index) * chunk_size(), chunk_index_size(index), false, prot);
+  return create_chunk(chunk_index_position(index), chunk_index_size(index), false, prot);
 }
 
 Chunk*
 FileList::create_hashing_chunk_index(uint32_t index, int prot) {
-  return create_chunk(static_cast<uint64_t>(index) * chunk_size(), chunk_index_size(index), true, prot);
+  return create_chunk(chunk_index_position(index), chunk_index_size(index), true, prot);
 }
 
 void
@@ -675,7 +687,7 @@ FileList::mark_completed(uint32_t index) {
   if (bitfield()->size_set() >= bitfield()->size_bits())
     throw internal_error("FileList::mark_completed(...) bitfield()->size_set() >= bitfield()->size_bits().", data()->hash());
 
-  LT_LOG_FL(DEBUG, "Done chunk: index:%" PRIu32 ".", index);
+  LT_LOG_DEBUG("done chunk : index:%" PRIu32 ".", index);
 
   m_data.mutable_completed_bitfield()->set(index);
   inc_completed(begin(), index);
@@ -699,7 +711,7 @@ FileList::inc_completed(iterator firstItr, uint32_t index) {
 
   // TODO: Check if this works right for zero-length files.
   std::for_each(firstItr,
-                lastItr == end() ? end() : (lastItr + 1),
+                lastItr == end() || (*lastItr)->range_first() > index ? lastItr : (lastItr + 1),
                 std::mem_fn(&File::inc_completed_protected));
 
   return lastItr;
@@ -736,7 +748,7 @@ FileList::update_completed() {
 // Used for metadata downloads.
 void
 FileList::reset_filesize(int64_t size) {
-  LT_LOG_FL(INFO, "Resetting torrent size: size:%" PRIi64 ".", size);
+  LT_LOG_EVENTS("reset torrent size : size:%" PRIi64 ".", size);
 
   close();
   m_chunk_size = size;

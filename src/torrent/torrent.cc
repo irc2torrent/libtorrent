@@ -93,6 +93,11 @@ cleanup() {
   if (manager == nullptr)
     throw internal_error("torrent::cleanup() called but the library is not initialized.");
 
+  // ~DownloadWrapper() unregisters from the tracker and disk threads destroyed below, so first
+  // remove the downloads the client left behind, the same way download_remove() does.
+  while (!manager->download_manager()->empty())
+    manager->cleanup_download(*manager->download_manager()->rbegin());
+
   // Might need to wait for the threads to finish?
   runtime::network_manager()->cleanup();
 
@@ -140,6 +145,10 @@ download_add(Object* object, uint32_t tracker_key) {
   else
     infoHash = object_sha1(&object->get_key("info"));
 
+  // tracker::Manager::add_controller() treats a zero hash as an internal error.
+  if (infoHash == std::string(HashString::size_data, '\0'))
+    throw input_error("Info hash is zero.");
+
   if (manager->download_manager()->find(infoHash) != manager->download_manager()->end())
     throw input_error("Info hash already used by another torrent.");
 
@@ -185,7 +194,16 @@ download_list(DList& dlist) {
 // Make sure you check that it's valid.
 Download
 download_find(const std::string& infohash) {
-  return *manager->download_manager()->find(infohash);
+  // DownloadManager::find() reads a full hash from the string.
+  if (infohash.size() != HashString::size_data)
+    return Download();
+
+  auto itr = manager->download_manager()->find(infohash);
+
+  if (itr == manager->download_manager()->end())
+    return Download();
+
+  return Download(*itr);
 }
 
 uint32_t

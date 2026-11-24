@@ -17,6 +17,7 @@ class TestTrackerController : public TestFixtureWithMainAndTrackerThread {
   CPPUNIT_TEST(test_send_start);
   CPPUNIT_TEST(test_send_stop_normal);
   CPPUNIT_TEST(test_send_completed_normal);
+  CPPUNIT_TEST(test_send_completed_no_success);
   CPPUNIT_TEST(test_send_update_normal);
   CPPUNIT_TEST(test_send_update_failure);
   CPPUNIT_TEST(test_send_task_timeout);
@@ -31,6 +32,7 @@ class TestTrackerController : public TestFixtureWithMainAndTrackerThread {
   CPPUNIT_TEST(test_timeout_lacking_usable);
   CPPUNIT_TEST(test_disable_tracker);
   CPPUNIT_TEST(test_new_peers);
+  CPPUNIT_TEST(test_success_with_active_scrape_reschedules_timeout);
 
   CPPUNIT_TEST_SUITE_END();
 
@@ -48,6 +50,7 @@ public:
   void test_send_start();
   void test_send_stop_normal();
   void test_send_completed_normal();
+  void test_send_completed_no_success();
   void test_send_update_normal();
   void test_send_update_failure();
   void test_send_task_timeout();
@@ -63,6 +66,12 @@ public:
   void test_timeout_lacking_usable();
   void test_disable_tracker();
   void test_new_peers();
+
+  // Regression: an announce success while another tracker is scraping must still
+  // schedule the next announce.  Before the fix, the controller waited for *all*
+  // activity (including scrapes) to finish, then receive_scrape() never
+  // rescheduled the announce timeout.
+  void test_success_with_active_scrape_reschedules_timeout();
 };
 
 #define TRACKER_CONTROLLER_SETUP()                                      \

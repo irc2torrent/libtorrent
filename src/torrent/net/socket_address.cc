@@ -127,10 +127,9 @@ sa_is_loopback(const sockaddr* sa) {
   case AF_INET:
     return sin_is_loopback(reinterpret_cast<const sockaddr_in*>(sa));
   case AF_INET6:
-    if (sa_is_v4mapped(sa)) {
-      uint32_t v4_raw = sin6_addr32_index(reinterpret_cast<const sockaddr_in6*>(sa), 3);
-      return (ntohl(v4_raw) >> 24) == 127;
-    }
+    if (sa_is_v4mapped(sa))
+      return reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr.s6_addr[12] == 127;
+
     return sin6_is_loopback(reinterpret_cast<const sockaddr_in6*>(sa));
   default:
     return false;
@@ -145,6 +144,33 @@ sin_is_loopback(const sockaddr_in* sa) {
 bool
 sin6_is_loopback(const sockaddr_in6* sa) {
   return IN6_IS_ADDR_LOOPBACK(&sa->sin6_addr);
+}
+
+bool
+sa_is_link_local(const sockaddr* sa) {
+  switch (sa->sa_family) {
+  case AF_INET:
+    return sin_is_link_local(reinterpret_cast<const sockaddr_in*>(sa));
+  case AF_INET6:
+    if (sa_is_v4mapped(sa)) {
+      const uint8_t* v4 = reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr.s6_addr + 12;
+      return v4[0] == 169 && v4[1] == 254;
+    }
+
+    return sin6_is_link_local(reinterpret_cast<const sockaddr_in6*>(sa));
+  default:
+    return false;
+  }
+}
+
+bool
+sin_is_link_local(const sockaddr_in* sa) {
+  return (ntohl(sa->sin_addr.s_addr) & 0xffff0000) == 0xa9fe0000;
+}
+
+bool
+sin6_is_link_local(const sockaddr_in6* sa) {
+  return IN6_IS_ADDR_LINKLOCAL(&sa->sin6_addr) || IN6_IS_ADDR_MC_LINKLOCAL(&sa->sin6_addr);
 }
 
 bool
@@ -214,6 +240,11 @@ sa_make_inet6() {
 sa_unique_ptr
 sa_make_inet6_any() {
   return sa_unique_ptr(reinterpret_cast<sockaddr*>(sin6_make_any().release()));
+}
+
+sa_unique_ptr
+sa_make_inet6_n(const char* addr, uint16_t port) {
+  return sa_unique_ptr(reinterpret_cast<sockaddr*>(sin6_make_n(addr, port).release()));
 }
 
 sa_unique_ptr
@@ -405,6 +436,17 @@ sin6_make_any() {
 
   sa->sin6_family = AF_INET6;
   sa->sin6_addr = in6addr_any;
+
+  return sa;
+}
+
+sin6_unique_ptr
+sin6_make_n(const char* addr, uint16_t port) {
+  sin6_unique_ptr sa(new sockaddr_in6{});
+
+  sa->sin6_family = AF_INET6;
+  std::memcpy(&sa->sin6_addr, addr, sizeof(in6_addr));
+  sa->sin6_port = port;
 
   return sa;
 }

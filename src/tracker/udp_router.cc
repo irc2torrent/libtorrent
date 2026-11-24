@@ -17,7 +17,7 @@
 #include "torrent/utils/log.h"
 
 #define LT_LOG(log_fmt, ...)                                            \
-  lt_log_print_subsystem(LOG_TRACKER_REQUESTS, "udp-router", log_fmt, __VA_ARGS__);
+  lt_log_print(LOG_TRACKER_REQUESTS, "udp-router : " log_fmt, __VA_ARGS__);
   // lt_log_print_subsystem(LOG_TRACKER_REQUESTS, "udp_router", "%p : " log_fmt, static_cast<TrackerWorker*>(this), __VA_ARGS__);
 
 // TODO: Add m_connections::iterator to info so we don't need to look them up. We should be able to
@@ -25,13 +25,24 @@
 
 namespace torrent::tracker {
 
-UdpRouter::UdpRouter()
-  : m_resolver_callback_id(system::make_callback_id()) {
+namespace {
 
+UdpRouter::random_engine
+create_random_engine() {
   std::random_device rd;
-  std::mt19937       mt(rd());
+  std::seed_seq      seed{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
 
-  m_random_engine.seed(mt());
+  UdpRouter::random_engine engine;
+  engine.seed(seed);
+
+  return engine;
+}
+
+} // namespace
+
+UdpRouter::UdpRouter()
+  : m_random_engine(create_random_engine()),
+    m_resolver_callback_id(system::make_callback_id()) {
 
   m_task_timeout.slot() = [this] { receive_timeout(); };
 }
@@ -50,7 +61,7 @@ UdpRouter::open(int family) {
 
   m_thread = this_thread::thread();
 
-  auto bind_address = runtime::network_config()->bind_address_for_udp_connect(family);
+  auto [bind_address, device_name] = runtime::network_config()->bind_address_for_udp_connect(family);
 
   if (bind_address == nullptr) {
     LT_LOG("could not open udp router : blocked or invalid bind address : family:%s", system::sa_family_enum(family));
@@ -67,6 +78,13 @@ UdpRouter::open(int family) {
     return;
   }
 
+  if (!device_name.empty() && !fd_bind_to_device(fd, device_name.c_str(), family)) {
+    LT_LOG("opening router failed : bind to device failed : family:%s device:%s errno:%s",
+           system::sa_family_enum(family), device_name.c_str(), system::errno_enum_str(errno).c_str());
+    fd_close(fd);
+    return;
+  }
+
   if (!fd_bind(fd, bind_address.get())) {
     LT_LOG("opening router failed : bind failed : family:%s bind_address:%s errno:%s",
            system::sa_family_enum(family), sa_pretty_str(bind_address.get()).c_str(), system::errno_enum_str(errno).c_str());
@@ -76,6 +94,7 @@ UdpRouter::open(int family) {
 
   set_file_descriptor(fd);
   set_socket_address(sa_copy(bind_address.get()));
+  set_socket_device_name(device_name);
 
   runtime::socket_manager()->register_event_or_throw(this, runtime::category_internal, [this]() {
       this_thread::poll()->open(this);
@@ -101,9 +120,7 @@ UdpRouter::close() {
   runtime::socket_manager()->unregister_event_or_throw(this, [this]() {
       this_thread::poll()->remove_and_close(this);
 
-      fd_close(file_descriptor());
-
-      reset_file_descriptor();
+      fd_close_and_clear(file_descriptor_ref());
       set_socket_address(sa_make_unspec());
     });
 
@@ -118,7 +135,7 @@ void
 UdpRouter::updated_network_config(int family) {
   assert(m_thread == this_thread::thread());
 
-  auto bind_address = runtime::network_config()->bind_address_for_udp_connect(family);
+  auto [bind_address, device_name] = runtime::network_config()->bind_address_for_udp_connect(family);
 
   if (bind_address == nullptr) {
     LT_LOG("closing udp router due to invalid or blocked bind address : family:%s", system::sa_family_enum(family));
@@ -129,7 +146,7 @@ UdpRouter::updated_network_config(int family) {
   if (bind_address->sa_family != family)
     throw internal_error("UdpRouter::updated_network_config() got bind address with wrong family.");
 
-  if (sa_equal(bind_address.get(), socket_address()))
+  if (sa_equal(bind_address.get(), socket_address()) && device_name == socket_device_name())
     return;
 
   LT_LOG("udp router bind address changed : old:%s new:%s", sa_pretty_str(socket_address()).c_str(), sa_pretty_str(bind_address.get()).c_str());
@@ -200,7 +217,8 @@ UdpRouter::transfer(uint32_t id, connection_params params) {
 
   auto new_itr = connect_unsafe(std::move(itr->second.address), params);
 
-  disconnect_unsafe(itr);
+  // connect_unsafe inserts into m_connections, which invalidates iterators when it rehashes.
+  disconnect_unsafe(m_connections.find(id));
 
   try_write_with_queues(new_itr->first, &new_itr->second);
 }
@@ -389,7 +407,7 @@ UdpRouter::try_write(uint32_t id, connection_info* info) {
       continue;
     }
 
-    if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR)
+    if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR || err == ENOBUFS)
       return EAGAIN;
 
     // To properly handle this, try_write() returning true means we don't touch the connection again.
@@ -553,7 +571,7 @@ UdpRouter::event_read() {
     }
 
     if (bytes_read == 0)
-      throw internal_error("UdpRouter::event_read() read datagram of length 0");
+      continue;
 
     m_buffer.set_end(bytes_read);
 

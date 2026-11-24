@@ -15,8 +15,8 @@
 
 // TODO: Add runtime category and add it to important/complete log outputs.
 
-#define LT_LOG_NOTICE(log_fmt, ...)                                     \
-  lt_log_print_subsystem(LOG_NOTICE, "runtime::network_manager", log_fmt, __VA_ARGS__);
+#define LT_LOG_ERROR(log_fmt, ...)                                     \
+  lt_log_print(LOG_ERRORS, "runtime::network_manager : " log_fmt, __VA_ARGS__);
 
 namespace torrent::runtime {
 
@@ -135,7 +135,7 @@ NetworkManager::dht_restart() {
     runtime::network_manager()->dht_controller()->start();
 
   } catch (const base_error& e) {
-    LT_LOG_NOTICE("Could not restart DHT server: %" PRIu16 " : %s", e.what());
+    LT_LOG_ERROR("Could not restart DHT server: %" PRIu16 " : %s", dht_port(), e.what());
     return;
   }
 }
@@ -169,10 +169,9 @@ NetworkManager::dht_add_bootstrap_node(std::string host, int port){
 }
 
 void
-NetworkManager::dht_add_peer_node([[maybe_unused]] const sockaddr* sa, [[maybe_unused]] int port) {
-  // Ignore peer nodes as we shouldn't need them(?)
-  //
-  // Re-enable this if it causes issues.
+NetworkManager::dht_add_peer_node(const sockaddr* sa, int port) {
+  // A family whose table is populated skips it, the other family may still need nodes (BEP 32).
+  m_dht_controller->add_peer_node(sa, port);
 }
 
 bool
@@ -205,7 +204,7 @@ NetworkManager::listen_open_unsafe(uint16_t first, uint16_t last) {
       options.check_dht = true;
   }
 
-  auto [inet_address, inet6_address, block_ipv4in6] = listen_addresses;
+  auto [inet_address, inet_device_name, inet6_address, inet6_device_name, block_ipv4in6] = listen_addresses;
 
   options.block_ipv4in6 = block_ipv4in6;
 
@@ -213,7 +212,9 @@ NetworkManager::listen_open_unsafe(uint16_t first, uint16_t last) {
     throw input_error("Neither IPv4 nor IPv6 listen address are suitable for opening listen sockets, check block_ipv4 and block_ipv6 settings.");
 
   if (inet_address != nullptr && inet6_address != nullptr) {
-    if (!Listen::open_both(m_listen_inet.get(), m_listen_inet6.get(), inet_address.get(), inet6_address.get(), options))
+    if (!Listen::open_both({m_listen_inet.get(), inet_address.get(), inet_device_name},
+                           {m_listen_inet6.get(), inet6_address.get(), inet6_device_name},
+                           options))
       return false;
 
     m_listen_port = m_listen_inet->port();
@@ -221,7 +222,7 @@ NetworkManager::listen_open_unsafe(uint16_t first, uint16_t last) {
   }
 
   if (inet_address != nullptr) {
-    if (!Listen::open_single(m_listen_inet.get(), inet_address.get(), options))
+    if (!Listen::open_single({m_listen_inet.get(), inet_address.get(), inet_device_name}, options))
       return false;
 
     m_listen_port = m_listen_inet->port();
@@ -229,7 +230,7 @@ NetworkManager::listen_open_unsafe(uint16_t first, uint16_t last) {
   }
 
   if (inet6_address != nullptr) {
-    if (!Listen::open_single(m_listen_inet6.get(), inet6_address.get(), options))
+    if (!Listen::open_single({m_listen_inet6.get(), inet6_address.get(), inet6_device_name}, options))
       return false;
 
     m_listen_port = m_listen_inet6->port();
@@ -264,7 +265,7 @@ NetworkManager::listen_restart_unsafe() {
     listen_open_unsafe(m_listen_port, m_listen_port);
 
   } catch (const base_error& e) {
-    LT_LOG_NOTICE("Could not restart listen socket: %" PRIu16 " : %s", e.what());
+    LT_LOG_ERROR("Could not restart listen socket: %" PRIu16 " : %s", m_listen_port, e.what());
     return;
   }
 }

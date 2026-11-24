@@ -12,6 +12,8 @@
 #include "data/socket_file.h"
 #include "torrent/exceptions.h"
 #include "torrent/data/file.h"
+#include "torrent/utils/chrono.h"
+#include "torrent/utils/limited_vector.h"
 #include "utils/fd_close_queue.h"
 
 namespace torrent {
@@ -81,6 +83,9 @@ FileManager::close(File* file) {
 
 void
 FileManager::close_files(const std::vector<File*>& files) {
+  if (files.empty())
+    return;
+
   std::vector<int> closed_fds;
   closed_fds.reserve(files.size());
 
@@ -96,6 +101,9 @@ FileManager::close_files(const std::vector<File*>& files) {
 
 void
 FileManager::close_files(const std::vector<std::unique_ptr<File>>& files) {
+  if (files.empty())
+    return;
+
   std::vector<int> closed_fds;
   closed_fds.reserve(files.size());
 
@@ -166,28 +174,11 @@ FileManager::get_least_active(unsigned int count) {
   if (count == 0)
     return {};
 
-  std::vector<File*> files;
-  files.reserve(count);
+  utils::limited_vector<File*, compare_file_by_last_touched> files(count);
 
-  for (auto* file : *this) {
-    if (files.size() == count) {
-      if (file->last_touched() >= files.back()->last_touched())
-        continue;
+  utils::copy_limited(begin(), end(), files);
 
-      files.back() = file;
-    } else {
-      files.push_back(file);
-    }
-
-    for (auto itr = std::prev(files.end()); itr != files.begin(); --itr) {
-      if ((*itr)->last_touched() >= (*std::prev(itr))->last_touched())
-        break;
-
-      std::iter_swap(itr, std::prev(itr));
-    }
-  }
-
-  return files;
+  return files.move_as_vector();
 }
 
 void
@@ -210,6 +201,9 @@ FileManager::evict_least_active(unsigned int count) {
   }
 
   m_least_active_cache.clear();
+
+  if (files_to_close.size() > count)
+    files_to_close.resize(count);
 
   close_files(files_to_close);
 
@@ -246,6 +240,33 @@ FileManager::evict_least_active_from_cache(unsigned int count) {
   close_files(files);
 
   return count;
+}
+
+void
+FileManager::periodic_close_idle() {
+  if (m_close_idle_timeout == 0s || empty())
+    return;
+
+  auto cached_seconds = this_thread::cached_seconds();
+
+  if (cached_seconds - m_close_idle_last_check < m_close_idle_timeout / 4)
+    return;
+
+  m_close_idle_last_check = cached_seconds;
+
+  std::vector<File*> files;
+
+  for (auto* file : *this) {
+    if (!file->is_open())
+      continue;
+
+    auto last_touched = utils::cast_seconds(file->last_touched_usec());
+
+    if (last_touched < cached_seconds && cached_seconds - last_touched > m_close_idle_timeout)
+      files.push_back(file);
+  }
+
+  close_files(files);
 }
 
 } // namespace torrent

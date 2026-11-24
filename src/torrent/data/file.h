@@ -82,6 +82,7 @@ public:
   void                set_protection(int prot)                 { m_protection = prot; }
 
   uint64_t            last_touched() const                     { return m_last_touched; }
+  auto                last_touched_usec() const                { return std::chrono::microseconds(m_last_touched); }
   void                set_last_touched(uint64_t t)             { m_last_touched = t; }
 
 protected:
@@ -126,6 +127,12 @@ private:
 
   uint32_t            m_match_depth_prev{0};
   uint32_t            m_match_depth_next{0};
+};
+
+struct compare_file_by_last_touched {
+  bool operator()(const File* a, const File* b) const {
+    return a->last_touched() < b->last_touched();
+  }
 };
 
 inline bool

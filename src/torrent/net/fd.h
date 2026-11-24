@@ -16,7 +16,8 @@ enum fd_flags : int {
   fd_flag_v4            = 0x80, // renamed
   fd_flag_v4only        = 0x80,
   fd_flag_v6only        = 0x100,
-  fd_flag_all           = 0x1ff,
+  fd_flag_v6            = 0x200,
+  fd_flag_all           = 0x3ff,
 };
 
 constexpr bool  fd_valid_flags(fd_flags flags);
@@ -33,12 +34,14 @@ int             fd_open_inotify() LIBTORRENT_EXPORT;
 
 void            fd_close(int fd) LIBTORRENT_EXPORT;
 void            fd_close_and_clear(int& fd) LIBTORRENT_EXPORT;
+void            fd_close_and_clear_if_open(int& fd) LIBTORRENT_EXPORT;
 
 int             fd_accept(int fd) LIBTORRENT_EXPORT;
 fd_sap_tuple    fd_sap_accept(int fd) LIBTORRENT_EXPORT;
 
 bool            fd_bind(int fd, const sockaddr* sa) LIBTORRENT_EXPORT;
 bool            fd_bind_with_length(int fd, const sockaddr* sa, socklen_t length) LIBTORRENT_EXPORT;
+bool            fd_bind_to_device(int fd, const char* device, int family) LIBTORRENT_EXPORT;
 bool            fd_connect(int fd, const sockaddr* sa) LIBTORRENT_EXPORT;
 bool            fd_connect_with_family(int fd, const sockaddr* sa, int family) LIBTORRENT_EXPORT;
 bool            fd_listen(int fd, int backlog) LIBTORRENT_EXPORT;
@@ -86,6 +89,7 @@ fd_valid_flags(fd_flags flags) {
     ((flags & fd_flag_stream) || (flags & fd_flag_datagram)) &&
     !((flags & fd_flag_stream) && (flags & fd_flag_datagram)) &&
     !((flags & fd_flag_v4only) && (flags & fd_flag_v6only)) &&
+    !((flags & fd_flag_v4) && (flags & fd_flag_v6)) &&
     !(flags & ~(fd_flag_all));
 }
 

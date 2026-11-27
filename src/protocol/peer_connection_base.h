@@ -27,8 +27,8 @@ class DownloadMain;
 
 class PeerConnectionBase : public Peer, public SocketStream {
 public:
-  using ProtocolRead  = protocol::ProtocolRead;
-  using ProtocolWrite = protocol::ProtocolWrite;
+  using ProtocolRead  = ProtocolBase;
+  using ProtocolWrite = ProtocolBase;
 
 #if USE_EXTRA_DEBUG == 666
   // For testing, use a really small buffer.
@@ -36,11 +36,6 @@ public:
 #else
   using EncryptBuffer = ProtocolBuffer<16384>;
 #endif
-
-  // Bitmasks for peer exchange messages to send.
-  static constexpr int PEX_DO      = (1 << 0);
-  static constexpr int PEX_ENABLE  = (1 << 1);
-  static constexpr int PEX_DISABLE = (1 << 2);
 
   PeerConnectionBase();
   ~PeerConnectionBase() override;
@@ -50,27 +45,8 @@ public:
   void                initialize(DownloadMain* download, PeerInfo* p, int fd, Bitfield* bitfield, EncryptionInfo* encryptionInfo, ProtocolExtension* extensions);
   void                cleanup();
 
-  bool                is_up_choked() const            { return m_up.choke.choked(); }
-  bool                is_up_interested() const        { return m_up.choke.queued(); }
-  bool                is_up_snubbed() const           { return m_up.choke.snubbed(); }
-
-  bool                is_down_queued() const          { return m_down.choke.queued(); }
-  bool                is_down_local_unchoked() const  { return m_down.choke.unchoked(); }
-  bool                is_down_remote_unchoked() const { return m_down.unchoked; }
-  bool                is_down_interest_withheld() const { return m_down.interest_withheld; }
-
-  // The peer choked us. A download choke that took its slot back told it we were not interested, so as not to hold
-  // its upload slot (receive_download_choke); without its upload slot that is final: an unchoke from a peer we are
-  // not interested in is ignored, and only a HAVE for a piece we want, which a seed never sends, makes it interesting
-  // again. So say we are interested again, unless the download is done. Returns whether INTERESTED is to be sent.
-  bool                restore_down_interest(bool download_done);
-
-  // A slot taken back by the download slot rotation (choke_queue::rotate_entry) keeps the torrent interested: the
-  // peer waits for a slot again as every queued peer does, and nothing tells it to choke us. Undoes what
-  // receive_download_choke withheld; the slot was held for choke_queue::rotate_grace at least, so no INTERESTED of
-  // ours is still unsent.
-  void                keep_down_interest();
-  bool                is_down_interested() const      { return m_down.interested; }
+  const auto&         up() const                      { return m_up; }
+  const auto&         down() const                    { return m_down; }
 
   void                set_upload_snubbed(bool v);
 
@@ -95,7 +71,7 @@ public:
   ProtocolExtension*  extensions()                    { return m_extensions; }
   DataBuffer*         extension_message()             { return &m_extension_message; }
 
-  void                do_peer_exchange()              { m_send_pex_mask |= PEX_DO; }
+  void                do_peer_exchange()              { m_up.schedule_pex_exchange(); }
   void                set_peer_exchange(bool state);
 
   // These must be implemented by the child class.
@@ -107,8 +83,6 @@ public:
   bool                receive_download_choke(bool choke);
 
   void                event_error() override;
-
-  void                push_unread(const void* data, uint32_t size);
 
   void                cancel_transfer(BlockTransfer* transfer);
 
@@ -122,7 +96,12 @@ public:
   bool                should_connection_unchoke(choke_queue* cq) const;
 
 protected:
+  friend class choke_queue;
+  friend class HandshakeManager;
+
   static constexpr uint32_t extension_must_encrypt = ~uint32_t();
+
+  auto&               down_mutable();
 
   void                load_up_chunk();
 
@@ -157,7 +136,7 @@ protected:
   bool                try_request_pieces();
 
   bool                send_pex_message();
-  bool                send_ext_message();
+  bool                send_pending_extension();
 
   DownloadMain*       m_download{};
 
@@ -166,12 +145,6 @@ protected:
   RequestList         m_request_list;
   protocol::StateUp   m_up;
   protocol::StateDown m_down;
-
-  bool                m_send_choked{};
-  bool                m_send_interested{};
-  bool                m_tryRequest{};
-
-  int                 m_send_pex_mask{};
 
   std::chrono::microseconds m_time_last_read{};
 
@@ -186,11 +159,7 @@ protected:
   bool                m_incore_continous{};
 };
 
-inline void
-PeerConnectionBase::push_unread(const void* data, uint32_t size) {
-  std::memcpy(m_down.protocol->buffer()->end(), data, size);
-  m_down.protocol->buffer()->move_end(size);
-}
+inline auto& PeerConnectionBase::down_mutable() { return m_down; }
 
 inline void
 PeerConnectionBase::read_insert_poll_safe() {

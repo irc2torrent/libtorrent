@@ -351,6 +351,19 @@ fd_close_and_clear_if_open(int& fd) {
 }
 
 int
+fd_socket(int domain, int type, int protocol) {
+  int fd = fd__socket(domain, type, protocol);
+
+  if (fd == -1) {
+    LT_LOG_FD_ERROR("fd_socket() failed");
+    return -1;
+  }
+
+  LT_LOG_FD("fd_socket() succeeded");
+  return fd;
+}
+
+int
 fd_accept(int fd) {
   int connection_fd = fd__accept(fd, nullptr, nullptr);
 
@@ -571,6 +584,22 @@ fd_get_socket_error(int fd, int* value) {
   }
 
   LT_LOG_FD_VALUE("fd_get_socket_error() succeeded", *value);
+  return true;
+}
+
+bool
+fd_get_socket_error_using_peek(int fd, int* value) {
+  char buffer[1];
+  ssize_t result = recv(fd, buffer, sizeof(buffer), MSG_PEEK | MSG_DONTWAIT);
+
+  if (result != -1) {
+    *value = 0;
+    LT_LOG_FD_VALUE("fd_get_socket_error_using_peek() did not find an error", *value);
+    return false;
+  }
+
+  *value = errno;
+  LT_LOG_FD_VALUE("fd_get_socket_error_using_peek() succeeded", *value);
   return true;
 }
 
